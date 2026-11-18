@@ -30,7 +30,9 @@ from core.telegram.risk import (
 )
 from core.telegram.seeds import (
     extract_telegram_seeds,
+    is_official_telegram_channel,
     merge_seed_lists,
+    official_telegram_usernames,
     parse_manual_seeds,
     seeds_from_videos,
 )
@@ -74,12 +76,14 @@ async def _scan_async(
     max_channels: int = TELEGRAM_MAX_CHANNELS,
     messages_per_channel: int = TELEGRAM_MESSAGES_PER_CHANNEL,
     enable_fingerprinting: bool = True,
+    official_usernames: Optional[set] = None,
     progress_cb: ProgressCb = None,
 ) -> Dict[str, Any]:
     client = _build_client()
     hits: List[dict] = []
     channels_scored: List[dict] = []
     discovered_seeds: List[dict] = []
+    official_usernames = official_usernames or set()
     stats = {
         "channels_attempted": 0,
         "channels_scanned": 0,
@@ -87,6 +91,8 @@ async def _scan_async(
         "media_fingerprinted": 0,
         "fingerprint_matches": 0,
         "keyword_hits": 0,
+        "official_channels_skipped_hits": 0,
+        "soft_signals_ignored": 0,
     }
 
     try:
@@ -134,6 +140,16 @@ async def _scan_async(
             stats["channels_scanned"] += 1
             stats["messages_scanned"] += len(messages)
 
+            is_official = is_official_telegram_channel(
+                official_usernames, seed=seed, meta=meta
+            )
+            if is_official:
+                _progress(
+                    progress_cb,
+                    f"Telegram: official channel {meta.get('username') or seed.get('value')} "
+                    "(invite discovery only; promo posts not flagged)",
+                )
+
             entity_hit_messages = 0
             media_count = 0
             invite_links_found = 0
@@ -145,7 +161,7 @@ async def _scan_async(
                 kw = message_keyword_hits(text, terms)
                 media = msg.get("media")
 
-                # Expand invite graph (1 hop)
+                # Expand invite graph (1 hop) — still useful on official channels
                 if TELEGRAM_EXPAND_INVITES and text:
                     nested = extract_telegram_seeds(
                         text, source=f"tg:{meta.get('username') or meta.get('id')}"
@@ -159,7 +175,7 @@ async def _scan_async(
                                 if len(queue) + len(scanned_keys) < max_channels * 2:
                                     queue.append(ns)
 
-                is_interesting = kw["score"] >= 25
+                dump_kw = bool(kw.get("dump_hits"))
                 media_dump = False
                 if media and looks_like_media_dump(
                     media.get("filename") or "",
@@ -168,19 +184,26 @@ async def _scan_async(
                 ):
                     media_count += 1
                     media_dump = True
-                    # Long media + any entity/piracy signal → interesting
-                    if int(media.get("duration") or 0) >= 600 or kw["score"] >= 15:
-                        is_interesting = True
 
                 if kw["entity_hits"]:
                     entity_hit_messages += 1
 
+                # Require dump evidence — entity/promo text alone is never enough
+                is_interesting = False
+                if dump_kw and (kw["entity_hits"] or kw["score"] >= 25):
+                    is_interesting = True
+                elif media_dump and (
+                    kw["entity_hits"] or dump_kw or int(media.get("duration") or 0) >= 600
+                ):
+                    is_interesting = True
+
                 fp_match = None
                 if (
-                    is_interesting
+                    (is_interesting or media_dump)
                     and media_dump
                     and media_budget > 0
                     and catalog_fp_index
+                    and not is_official  # don't fingerprint rights-holder's own uploads
                 ):
                     _progress(
                         progress_cb,
@@ -198,19 +221,36 @@ async def _scan_async(
                                 stats["fingerprint_matches"] += 1
                                 is_interesting = True
 
-                if not is_interesting and not (fp_match and fp_match.get("is_match")):
+                fp_ok = bool(fp_match and fp_match.get("is_match"))
+                if not is_interesting and not fp_ok:
+                    if kw["score"] > 0 or kw["entity_hits"]:
+                        stats["soft_signals_ignored"] += 1
+                    continue
+
+                # Official whitelist: never emit keyword/media false positives
+                if is_official and not fp_ok:
+                    stats["official_channels_skipped_hits"] += 1
                     continue
 
                 stats["keyword_hits"] += 1
-                conf = kw["score"]
+                conf = max(kw["score"], 40 if media_dump else 0)
                 cls = "PIRATED"
-                reason = "Telegram message matched entity/piracy signals"
-                if fp_match and fp_match.get("is_match"):
+                reason = "Telegram dump signals (keywords/media) matched entity"
+                if fp_ok:
                     conf = max(conf, int(fp_match["similarity"] * 100))
                     reason = (
                         f"Audio fingerprint match ({fp_match['similarity']:.0%}) "
                         f"with official: {fp_match.get('official_title') or fp_match.get('official_video_id')}"
                     )
+                elif media_dump and dump_kw:
+                    conf = max(conf, 70)
+                    reason = "Telegram media dump + piracy redistribution keywords"
+                elif media_dump:
+                    conf = max(conf, 55)
+                    reason = "Telegram long/media file with entity signals"
+                elif dump_kw:
+                    conf = max(conf, 60)
+                    reason = "Telegram message has redistribution/dump keywords"
 
                 hit = {
                     "platform": "telegram",
@@ -248,6 +288,7 @@ async def _scan_async(
                 "invite_links_found": invite_links_found,
                 "fingerprint_matches": fp_matches,
                 "messages_scanned": len(messages),
+                "is_official": is_official,
             }
             risk = score_channel(meta, msg_stats)
             channels_scored.append(
@@ -290,6 +331,7 @@ def run_telegram_scan(
     catalog_fp_index: Optional[List[dict]] = None,
     enable_fingerprinting: bool = True,
     max_channels: int = TELEGRAM_MAX_CHANNELS,
+    official_telegram: Optional[Any] = None,
     progress_cb: ProgressCb = None,
 ) -> Dict[str, Any]:
     """Sync entrypoint for Flask workers.
@@ -299,6 +341,7 @@ def run_telegram_scan(
     yt_seeds = seeds_from_videos(youtube_videos or [])
     man_seeds = parse_manual_seeds(manual_seeds)
     seeds = merge_seed_lists(man_seeds, yt_seeds)
+    official = official_telegram_usernames(official_telegram)
 
     base = {
         "ok": True,
@@ -307,6 +350,7 @@ def run_telegram_scan(
         "seeds": seeds,
         "youtube_bridge_seeds": len(yt_seeds),
         "manual_seeds": len(man_seeds),
+        "official_telegram": sorted(official),
         "discovered_seeds": [],
         "channels": [],
         "hits": [],
@@ -332,6 +376,12 @@ def run_telegram_scan(
         )
         return base
 
+    if official:
+        _progress(
+            progress_cb,
+            f"Telegram: whitelisting {len(official)} official channel(s)",
+        )
+
     _progress(progress_cb, f"Telegram: scanning {min(len(seeds), max_channels)} seed channels...")
     result = run_async(
         _scan_async(
@@ -340,10 +390,12 @@ def run_telegram_scan(
             catalog_fp_index=catalog_fp_index,
             max_channels=max_channels,
             enable_fingerprinting=enable_fingerprinting,
+            official_usernames=official,
             progress_cb=progress_cb,
         )
     )
     result["mode"] = "full"
     result["youtube_bridge_seeds"] = len(yt_seeds)
     result["manual_seeds"] = len(man_seeds)
+    result["official_telegram"] = sorted(official)
     return result

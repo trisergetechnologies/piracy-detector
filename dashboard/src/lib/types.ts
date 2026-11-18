@@ -17,6 +17,8 @@ export interface TelegramScanParams {
   entity_name: string;
   entity_type?: string;
   telegram_seeds?: string[];
+  /** Rights-holder Telegram @channels — never flagged as piracy */
+  official_telegram?: string[];
   bridge_youtube_scan_id?: string;
   official_channel_ids?: string[];
   official_playlist_ids?: string[];

@@ -32,6 +32,7 @@ export default function TelegramScanPage() {
 
   const [entityName, setEntityName] = useState("");
   const [telegramSeeds, setTelegramSeeds] = useState("");
+  const [officialTelegram, setOfficialTelegram] = useState("");
   const [officialChannelIds, setOfficialChannelIds] = useState("");
   const [officialPlaylistIds, setOfficialPlaylistIds] = useState("");
   const [bridgeScanId, setBridgeScanId] = useState("");
@@ -128,8 +129,10 @@ export default function TelegramScanPage() {
       min_confidence: minConfidence,
       include_stored_seeds: true,
     };
+    const officialTg = splitIds(officialTelegram);
     const officialChannels = splitIds(officialChannelIds);
     const officialPlaylists = splitIds(officialPlaylistIds);
+    if (officialTg.length) params.official_telegram = officialTg;
     if (officialChannels.length) params.official_channel_ids = officialChannels;
     if (officialPlaylists.length) params.official_playlist_ids = officialPlaylists;
     if (bridgeScanId) params.bridge_youtube_scan_id = bridgeScanId;
@@ -188,8 +191,8 @@ export default function TelegramScanPage() {
         />
 
         <TextField
-          label="Telegram seeds (manual)"
-          placeholder={"@channel\nhttps://t.me/some_dump\nhttps://t.me/+inviteHash"}
+          label="Telegram seeds (suspect channels to scan)"
+          placeholder={"@dump_channel\nhttps://t.me/some_dump\nhttps://t.me/+inviteHash"}
           fullWidth
           multiline
           minRows={3}
@@ -197,6 +200,20 @@ export default function TelegramScanPage() {
           onChange={(e) => setTelegramSeeds(e.target.value)}
           disabled={scanning}
           size="small"
+          helperText="Channels suspected of leaking content — not the educator's official channel"
+        />
+
+        <TextField
+          label="Official Telegram channels (whitelist)"
+          placeholder={"https://t.me/DrVanisNEETExcellence\n@OfficialBrand"}
+          fullWidth
+          multiline
+          minRows={2}
+          value={officialTelegram}
+          onChange={(e) => setOfficialTelegram(e.target.value)}
+          disabled={scanning}
+          size="small"
+          helperText="Rights-holder channels — promo posts here are never flagged as piracy"
         />
 
         <TextField

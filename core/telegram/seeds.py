@@ -159,3 +159,39 @@ def seed_to_telethon_ref(seed: dict) -> str:
     if seed.get("kind") == "invite":
         return seed.get("url") or f"https://t.me/+{seed.get('value')}"
     return seed.get("value") or ""
+
+
+def official_telegram_usernames(raw: Optional[Union[str, List[str]]]) -> Set[str]:
+    """Normalize official Telegram channels into a lowercase username set.
+
+    Accepts the same formats as parse_manual_seeds (@name, t.me/name, bare name).
+    Invite hashes are ignored (cannot whitelist private invites by username).
+    """
+    seeds = parse_manual_seeds(raw)
+    out: Set[str] = set()
+    for s in seeds:
+        if s.get("kind") != "public":
+            continue
+        name = _norm_username(str(s.get("value") or ""))
+        if name:
+            out.add(name)
+    return out
+
+
+def is_official_telegram_channel(
+    official: Set[str],
+    seed: Optional[dict] = None,
+    meta: Optional[dict] = None,
+) -> bool:
+    """True when seed/meta username is in the official whitelist."""
+    if not official:
+        return False
+    candidates = []
+    if seed:
+        if seed.get("kind") == "public":
+            candidates.append(_norm_username(str(seed.get("value") or "")))
+        if seed.get("is_official"):
+            return True
+    if meta:
+        candidates.append(_norm_username(str(meta.get("username") or "")))
+    return any(c and c in official for c in candidates)

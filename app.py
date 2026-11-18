@@ -434,6 +434,7 @@ def _do_telegram_scan_work(
     enable_fingerprinting: bool,
     bridge_youtube_scan_id: Optional[str],
     min_conf: int,
+    official_telegram: Any = None,
 ) -> None:
     """Background Telegram scan (Phase C)."""
     try:
@@ -467,6 +468,7 @@ def _do_telegram_scan_work(
             youtube_videos=youtube_videos,
             catalog_fp_index=catalog_fp_index or None,
             enable_fingerprinting=enable_fingerprinting,
+            official_telegram=official_telegram,
             progress_cb=_prog,
         )
 
@@ -522,8 +524,15 @@ def _do_telegram_scan_work(
             "telegram": {
                 "seeds": len(result.get("seeds") or []),
                 "discovered_seeds": len(result.get("discovered_seeds") or []),
+                "official_telegram": result.get("official_telegram") or [],
                 "channels_scanned": (result.get("stats") or {}).get("channels_scanned", 0),
                 "fingerprint_matches": (result.get("stats") or {}).get("fingerprint_matches", 0),
+                "official_channels_skipped_hits": (result.get("stats") or {}).get(
+                    "official_channels_skipped_hits", 0
+                ),
+                "soft_signals_ignored": (result.get("stats") or {}).get(
+                    "soft_signals_ignored", 0
+                ),
                 "youtube_bridge_seeds": result.get("youtube_bridge_seeds", 0),
                 "warning": result.get("warning"),
                 "error": result.get("error"),
@@ -692,6 +701,7 @@ def scan_telegram():
     Body:
       entity_name (required)
       telegram_seeds: list/string of @channels / t.me links
+      official_telegram: list/string of rights-holder Telegram channels (whitelist)
       bridge_youtube_scan_id: optional prior YouTube scan to harvest t.me seeds
       official_channel_ids / official_playlist_ids: for fingerprint proof
       enable_fingerprinting: bool
@@ -703,6 +713,12 @@ def scan_telegram():
         return jsonify({"ok": False, "error": "Missing 'entity_name'"}), 400
 
     manual_seeds = data.get("telegram_seeds") or data.get("seeds") or []
+    official_telegram = (
+        data.get("official_telegram")
+        or data.get("official_telegram_seeds")
+        or data.get("official_telegram_channels")
+        or []
+    )
     official_channel_ids = data.get("official_channel_ids", []) or []
     official_playlist_ids = data.get("official_playlist_ids", []) or []
     if isinstance(official_channel_ids, str):
@@ -729,6 +745,7 @@ def scan_telegram():
         "bridge_youtube_scan_id": bridge_youtube_scan_id,
         "official_channel_ids": official_channel_ids,
         "official_playlist_ids": official_playlist_ids,
+        "official_telegram": official_telegram,
     })
 
     thread = threading.Thread(
@@ -742,6 +759,7 @@ def scan_telegram():
             enable_fingerprinting,
             bridge_youtube_scan_id,
             min_conf,
+            official_telegram,
         ),
         daemon=True,
     )
