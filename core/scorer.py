@@ -305,9 +305,17 @@ def piracy_evidence(enriched_video: dict, text_result: Optional[dict] = None) ->
                 "reason": f"title shares only common course words with official video "
                           f"'{official_title}' ({title_sim:.0%}); content not verified{llm_note}"}
     dur_ref = _signal_value(signals, "duration_equals_official")
-    if dur_ref and ("brand_mention" in signals or "piracy_title_kw" in signals):
+    if dur_ref and "brand_mention" in signals:
         return {"tier": "weak", "confidence": 62,
-                "reason": f"same duration as official video {dur_ref} plus brand/piracy wording; "
+                "reason": f"same duration as official video {dur_ref} and names the rights holder; "
+                          f"content not verified{llm_note}"}
+    if dur_ref and "piracy_title_kw" in signals:
+        # Measured on a real scan: 6 of 6 such hits were unrelated channels.
+        # With ~200 official durations a 1-second coincidence is common, and
+        # "free"/"batch" wording is normal for coaching channels. Kept below
+        # the default threshold (logged, not alerted).
+        return {"tier": "weak", "confidence": 50,
+                "reason": f"same duration as official video {dur_ref} plus free/batch wording only; "
                           f"content not verified{llm_note}"}
     # Heuristics alone only count when the classifier could not run; otherwise
     # its LEGITIMATE verdict stands.

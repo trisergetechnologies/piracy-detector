@@ -139,6 +139,22 @@ def test_same_lecture_title_still_flagged_and_duration_makes_it_likely():
     assert piracy_evidence(copy, {"llm_error": True})["tier"] == "likely"
 
 
+def test_duration_coincidence_with_free_wording_stays_below_threshold():
+    # Real false positive: unrelated channel, same length as some official
+    # video, "free batch" in the title.
+    from core.scorer import piracy_evidence
+
+    cat = _exam_catalog()
+    v = _video(title="Class 10 Maths free batch lecture 1", duration_seconds=3600)
+    v["heuristic"] = piracy_heuristic_score(v, cat)
+    assert any(s.startswith("duration_equals_official") for s in v["heuristic"]["signals"])
+    assert piracy_evidence(v, {"llm_error": True})["confidence"] < 60
+
+    named = _video(title="Brand paid batch free lecture 1", duration_seconds=3600)
+    named["heuristic"] = piracy_heuristic_score(named, cat, entity_name="Brand")
+    assert piracy_evidence(named, {"llm_error": True})["confidence"] >= 60
+
+
 def test_funnel_redacts_api_keys():
     from core import funnel
 
