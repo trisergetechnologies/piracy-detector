@@ -1,0 +1,26 @@
+[Unit]
+Description=Piracy Detector API (Flask/Gunicorn)
+After=network.target mongod.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/piracy-detector
+EnvironmentFile=-/var/www/piracy-detector/.env
+# Single worker: in-process monitor scheduler must not be duplicated
+ExecStart=/var/www/piracy-detector/venv/bin/gunicorn \
+  --bind 127.0.0.1:5001 \
+  --workers 1 \
+  --threads 4 \
+  --timeout 600 \
+  --graceful-timeout 30 \
+  --access-logfile - \
+  --error-logfile - \
+  app:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

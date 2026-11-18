@@ -1,0 +1,19 @@
+[Unit]
+Description=Piracy Detector Dashboard (Next.js)
+After=network.target piracy-api.service
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/piracy-detector/dashboard
+Environment=NODE_ENV=production
+Environment=PORT=3001
+Environment=NEXT_PUBLIC_API_URL=http://127.0.0.1:5001
+EnvironmentFile=-/var/www/piracy-detector/.env
+ExecStart=/usr/bin/npm start -- -p 3001
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
