@@ -50,7 +50,7 @@ export default function ReportViewer({
 
   return (
     <div className="space-y-4">
-      <Tabs value={tab} onChange={(_, v) => setTab(v)} size="small">
+      <Tabs value={tab} onChange={(_, v) => setTab(v)}>
         {reports.map((r, i) => (
           <Tab key={i} label={r.label} />
         ))}
