@@ -10,8 +10,6 @@ from typing import Dict, List, Optional
 
 from config import (
     DEFAMATORY_BIG_CHANNEL_THRESHOLD,
-    FINGERPRINT_MATCH_THRESHOLD,
-    FINGERPRINT_STRONG_THRESHOLD,
     MIN_CONFIDENCE,
     SEVERITY_ORDER,
 )
@@ -91,10 +89,12 @@ def _meta_score(
         elif duration >= 600:
             score += 12
 
-    # High views suggest wider harm (0-20)
-    # BUT for DEFAMATORY from big channels, high views just means mainstream news.
+    # High views suggest wider harm (0-20) – defamatory only.
+    # For piracy, popularity is never a signal: a 12-view copy is as pirated
+    # as a viral one. For DEFAMATORY from big channels, high views just means
+    # mainstream news.
     views = safe_int(stats.get("viewCount"))
-    suppress_view_boost = text_cls == "DEFAMATORY" and is_big_channel
+    suppress_view_boost = text_cls == "PIRATED" or (text_cls == "DEFAMATORY" and is_big_channel)
     if not suppress_view_boost:
         if views > 1_000_000:
             score += 20
@@ -112,13 +112,6 @@ def _meta_score(
             score += 15
         elif eng > 0.02:
             score += 8
-
-    # Piracy signal: disabled comments/likes (pirates often disable these)
-    if text_cls == "PIRATED":
-        if comments == 0 and views > 100:
-            score += 10
-        if likes == 0 and views > 100:
-            score += 5
 
     # Recency -- newer = more urgent (0-15)
     pub = snippet.get("publishedAt", "")
@@ -200,31 +193,20 @@ def _channel_score(channel_info: Optional[dict], text_cls: str = "LEGITIMATE") -
         except Exception:
             pass
 
-    # Low subscriber count with lots of videos = piracy signal (0-25)
-    if subs < 1000 and video_count > 10:
-        score += 25
-    elif subs < 5000 and video_count > 50:
-        score += 15
-    elif subs < 10_000 and video_count > 100:
-        score += 10
-
     # Minimal channel description (0-10)
     desc = snippet.get("description", "")
     if len(desc) < 50:
         score += 10
 
-    # Generic education-keyword names on small channels = piracy signal (0-20)
+    # Generic education-keyword channel names (0-20). No subscriber condition:
+    # channel size is not evidence of piracy either way.
     piracy_keywords = [
         "study", "education", "lecture", "class", "academy", "free",
         "batch", "tutorial", "learning", "exam", "preparation", "jee",
         "neet", "pw", "wallah", "hub", "zone", "point",
     ]
-    if subs < 10_000 and any(kw in ch_name for kw in piracy_keywords):
+    if text_cls == "PIRATED" and any(kw in ch_name for kw in piracy_keywords):
         score += 20
-
-    # Extra boost: if LLM flagged PIRATED and channel is tiny, it's very suspicious
-    if text_cls == "PIRATED" and subs < 5000:
-        score += 15
 
     # Big-channel penalty for DEFAMATORY: established channels are almost never
     # actual troll/meme creators; they are news outlets or commentary channels.
@@ -237,6 +219,95 @@ def _channel_score(channel_info: Optional[dict], text_cls: str = "LEGITIMATE") -
             score -= 25
 
     return max(min(score, 100.0), 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Piracy evidence tiers
+# ---------------------------------------------------------------------------
+#   confirmed (conf 90-99) – the content itself matches official content
+#   likely    (conf 70-89) – borderline content match, or same title AND same
+#                            duration as an official video, or LLM + title match
+#   weak      (conf <= 69) – metadata only (LLM alone, title alone, heuristics
+#                            alone). Kept and labelled, never silently dropped.
+# Views, likes and subscriber counts are not inputs.
+
+
+def _signal_value(signals: List[str], prefix: str) -> Optional[str]:
+    for s in signals:
+        if s == prefix or s.startswith(prefix + ":"):
+            return s.split(":", 1)[1] if ":" in s else ""
+    return None
+
+
+def piracy_evidence(enriched_video: dict, text_result: Optional[dict] = None) -> dict:
+    """Return {"tier": confirmed|likely|weak|None, "confidence": int, "reason": str}."""
+    text_result = text_result or {}
+    heur = enriched_video.get("heuristic") or {}
+    signals: List[str] = list(heur.get("signals") or [])
+    h_score = float(heur.get("heuristic_score") or 0)
+    cm = heur.get("catalog_match") or {}
+    fm = enriched_video.get("fingerprint_match") or {}
+
+    llm_failed = bool(text_result.get("llm_error"))
+    llm_conf = int(float(text_result.get("confidence") or 0))
+    llm_pirated = (
+        not llm_failed
+        and text_result.get("classification") == "PIRATED"
+        and llm_conf >= MIN_CONFIDENCE
+    )
+    llm_note = " (AI classifier unavailable)" if llm_failed else ""
+
+    # 1. Content match
+    if fm.get("is_match"):
+        sim = float(fm.get("similarity") or 0)
+        official = fm.get("official_title") or fm.get("official_video_id") or "official content"
+        backend = fm.get("backend") or "audio"
+        if backend == "transcript":
+            what = f"spoken words match official video '{official}' ({sim:.0%} of sampled phrases"
+            what += f", {fm.get('shared_phrases')} shared)" if fm.get("shared_phrases") else ")"
+            if fm.get("audio_similarity"):
+                what += f"; audio fingerprint agrees ({float(fm['audio_similarity']):.0%})"
+        else:
+            what = f"audio fingerprint ({backend}) matches official video '{official}' ({sim:.0%})"
+        tier = fm.get("tier") or ("confirmed" if fm.get("is_strong") else "likely")
+        if tier == "confirmed":
+            return {"tier": "confirmed", "confidence": min(max(90, int(round(sim * 100))), 99),
+                    "reason": what}
+        return {"tier": "likely", "confidence": min(89, 74 + int(sim * 15)), "reason": what}
+
+    # 2. Metadata evidence against the official catalog
+    title_sim = float(cm.get("similarity") or 0)
+    same_duration = "duration_match_official" in signals
+    official_title = cm.get("official_title") or ""
+    if cm and same_duration:
+        return {"tier": "likely", "confidence": 85 if title_sim >= 0.7 else 80,
+                "reason": f"same title ({title_sim:.0%} similar) and same duration as official "
+                          f"video '{official_title}', uploaded by a non-official channel{llm_note}"}
+    if cm and llm_pirated:
+        return {"tier": "likely", "confidence": 75,
+                "reason": f"title matches official video '{official_title}' ({title_sim:.0%}) and "
+                          f"AI classifier flagged it: {text_result.get('reason', '')}"}
+
+    # 3. Weak: one metadata signal only
+    if llm_pirated:
+        return {"tier": "weak", "confidence": min(max(llm_conf - 20, 60), 69),
+                "reason": f"metadata only, no content match – AI classifier: {text_result.get('reason', '')}"}
+    if cm:
+        return {"tier": "weak", "confidence": min(69, 58 + int(title_sim * 10)),
+                "reason": f"title resembles official video '{official_title}' ({title_sim:.0%}); "
+                          f"content not verified{llm_note}"}
+    dur_ref = _signal_value(signals, "duration_equals_official")
+    if dur_ref and ("brand_mention" in signals or "piracy_title_kw" in signals):
+        return {"tier": "weak", "confidence": 62,
+                "reason": f"same duration as official video {dur_ref} plus brand/piracy wording; "
+                          f"content not verified{llm_note}"}
+    # Heuristics alone only count when the classifier could not run; otherwise
+    # its LEGITIMATE verdict stands.
+    if llm_failed and h_score >= 40 and "brand_mention" in signals:
+        shown = ", ".join(s for s in signals if not s.startswith("tier:"))
+        return {"tier": "weak", "confidence": min(69, 40 + int(h_score * 0.4)),
+                "reason": f"heuristics only ({shown}); content not verified{llm_note}"}
+    return {"tier": None, "confidence": 0, "reason": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -290,8 +361,18 @@ def compute_final_score(
         or video_detail.get("snippet", {}).get("description", "")
         or ""
     )
-    meta_s = _meta_score(video_detail, text_cls, channel_subs=ch_subs, description=description)
-    chan_s = _channel_score(channel_info, text_cls)
+    # Piracy evidence is evaluated first so that a video proven by content or
+    # catalog evidence is scored as PIRATED (no view/subscriber terms) even
+    # when the LLM said LEGITIMATE or could not run.
+    evidence = piracy_evidence(enriched_video, text_result)
+    tier = evidence["tier"]
+    llm_defamatory = text_cls == "DEFAMATORY" and text_conf >= MIN_CONFIDENCE
+    if tier and llm_defamatory and tier == "weak":
+        tier = None  # a confident DEFAMATORY verdict outranks metadata-only piracy
+    score_cls = "PIRATED" if tier else text_cls
+
+    meta_s = _meta_score(video_detail, score_cls, channel_subs=ch_subs, description=description)
+    chan_s = _channel_score(channel_info, score_cls)
 
     final = (
         W_TEXT * text_s
@@ -300,65 +381,41 @@ def compute_final_score(
         + W_CHANNEL * chan_s
     )
 
-    # --- Combined piracy boost ---
-    # Small channel + long video + telegram/drive in description = very high piracy
-    if text_cls == "PIRATED":
-        duration = enriched_video.get("duration_seconds", 0) or parse_duration(
-            video_detail.get("contentDetails", {}).get("duration", "")
-        )
-        desc_piracy = _desc_piracy_score(description)
-        is_small = ch_subs < 50_000
-        is_long = duration >= 600
-        has_telegram = desc_piracy >= 30
-
-        if is_small and is_long and has_telegram:
-            final = min(final + 15, 100.0)
-        elif is_small and has_telegram:
-            final = min(final + 10, 100.0)
-        elif is_small and is_long:
-            final = min(final + 5, 100.0)
-
-        # Phase A: catalog title match + low views strengthen piracy confidence
-        heur = enriched_video.get("heuristic") or {}
-        catalog_match = heur.get("catalog_match")
-        if catalog_match and catalog_match.get("similarity", 0) >= 0.45:
-            final = min(final + 8 + catalog_match["similarity"] * 7, 100.0)
-        views = safe_int(
-            enriched_video.get("view_count")
-            or video_detail.get("statistics", {}).get("viewCount")
-        )
-        if is_small and is_long and 0 < views < 5000:
-            final = min(final + 6, 100.0)
-
-    # Determine classification: trust the LLM unless it has very low confidence
+    # LLM verdict (defamatory path unchanged): trusted only above MIN_CONFIDENCE
     classification = text_cls if text_conf >= MIN_CONFIDENCE else "LEGITIMATE"
     confidence = int(text_conf)
     reason = text_result.get("reason", "")
-
-    # --- Phase B: audio fingerprint can prove piracy and override LLM ---
-    fp_match = enriched_video.get("fingerprint_match") or {}
-    fp_sim = float(fp_match.get("similarity") or 0)
-    fp_score = round(fp_sim * 100, 1)
-    if fp_match.get("is_match") and fp_sim >= FINGERPRINT_MATCH_THRESHOLD:
-        classification = "PIRATED"
-        # Confidence from match quality, not LLM vibes
-        confidence = max(confidence, int(round(fp_sim * 100)))
-        final = max(final, min(55 + fp_sim * 45, 100.0))
-        official_title = fp_match.get("official_title") or fp_match.get("official_video_id")
-        reason = (
-            f"Audio fingerprint match ({fp_sim:.0%}) with official content"
-            + (f": {official_title}" if official_title else "")
-        )
-        if fp_match.get("is_strong") or fp_sim >= FINGERPRINT_STRONG_THRESHOLD:
-            confidence = max(confidence, 92)
-            final = max(final, 90.0)
-
-    # Severity mapping
     severity = text_result.get("severity", "low")
-    if final >= 80:
-        severity = "critical"
-    elif final >= 60:
-        severity = max(severity, "high", key=lambda s: SEVERITY_ORDER.get(s, 0))
+
+    # --- Piracy: evidence tiers decide; the LLM is only one of the signals ---
+    fp_match = enriched_video.get("fingerprint_match") or {}
+    fp_score = round(float(fp_match.get("similarity") or 0) * 100, 1)
+    if tier:
+        classification = "PIRATED"
+        confidence = evidence["confidence"]
+        reason = f"{tier.upper()}: {evidence['reason']}"
+        # The score of a piracy hit is its evidence confidence, so results sort
+        # by strength of proof (confirmed 90+, likely 70-89, weak <= 69).
+        final = float(confidence)
+        if tier == "confirmed":
+            severity = "critical"
+        elif tier == "likely":
+            severity = "high"
+        else:
+            severity = max(severity, "medium", key=lambda s: SEVERITY_ORDER.get(s, 0))
+    elif classification == "PIRATED":
+        # Safeguard: a PIRATED verdict always has a tier; never report one without it.
+        classification = "LEGITIMATE"
+    else:
+        if final >= 80:
+            severity = "critical"
+        elif final >= 60:
+            severity = max(severity, "high", key=lambda s: SEVERITY_ORDER.get(s, 0))
+
+    heur = enriched_video.get("heuristic")
+    if tier and isinstance(heur, dict):
+        sigs = [s for s in heur.get("signals") or [] if not s.startswith("tier:")]
+        heur["signals"] = sigs + [f"tier:{tier}"]
 
     return {
         "final_score": round(final, 1),

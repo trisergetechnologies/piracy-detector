@@ -55,9 +55,10 @@ def download_audio_sample(
         "noprogress": True,
         "ignoreerrors": True,
         "noplaylist": True,
-        # Only fetch the opening window – critical for speed on long lectures
-        "download_sections": [f"*0-{sample_seconds}"],
-        "force_keyframes_at_cuts": True,
+        # Only fetch the opening window – critical for speed on long lectures.
+        # (The CLI-only "download_sections" key used before was ignored by the
+        # Python API, so whole lectures were being downloaded.)
+        "download_ranges": yt_dlp.utils.download_range_func(None, [(0, sample_seconds)]),
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",

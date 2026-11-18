@@ -52,6 +52,56 @@ def safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+_UC_ID = re.compile(r"UC[\w-]{22}")
+
+
+def parse_channel_ref(ref: str) -> tuple:
+    """Classify a channel reference -> (kind, value); kind: id|handle|user|name."""
+    ref = (ref or "").strip().rstrip("/")
+    if not ref:
+        return "name", ""
+    if _UC_ID.fullmatch(ref):
+        return "id", ref
+    m = re.search(r"/channel/(UC[\w-]{22})", ref)
+    if m:
+        return "id", m.group(1)
+    m = re.search(r"(?:^|/)@([\w.\-]+)", ref)
+    if m:
+        return "handle", m.group(1)
+    m = re.search(r"/user/([\w.\-]+)", ref)
+    if m:
+        return "user", m.group(1)
+    m = re.search(r"youtube\.com/(?:c/)?([\w.\-]+)$", ref)
+    if m:
+        return "name", m.group(1)
+    return "name", ref if re.fullmatch(r"[\w.\-]+", ref) else ""
+
+
+def parse_playlist_ref(ref: str) -> str:
+    """Accept a playlist id or URL containing list=… and return the id ('' if none)."""
+    ref = (ref or "").strip()
+    m = re.search(r"[?&]list=([\w-]+)", ref)
+    if m:
+        return m.group(1)
+    return ref if re.fullmatch(r"[\w-]{12,}", ref) else ""
+
+
+def _resolve_channel_via_ytdlp(url: str) -> Optional[str]:
+    """Zero-quota fallback: read the channel id from the channel page."""
+    try:
+        import yt_dlp
+
+        opts = {"quiet": True, "no_warnings": True, "extract_flat": True,
+                "playlist_items": "0", "skip_download": True}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+        cid = info.get("channel_id") or info.get("uploader_id") or ""
+        return cid if _UC_ID.fullmatch(cid) else None
+    except Exception as exc:
+        logger.info("yt-dlp channel resolve failed for %s: %s", url, exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # YouTube API Manager
 # ---------------------------------------------------------------------------
@@ -68,6 +118,7 @@ class YouTubeClient:
         self._clients: Dict[int, Any] = {}
         self._channel_cache: Dict[str, dict] = {}
         self._cache_expiry: Dict[str, datetime] = {}
+        self._resolved: Dict[str, str] = {}
 
         for i, key in enumerate(self.api_keys):
             try:
@@ -140,6 +191,38 @@ class YouTubeClient:
         return all_items
 
     # -- public channel helpers ---------------------------------------------
+
+    def resolve_channel_id(self, ref: str) -> Optional[str]:
+        """Accept a UC… id, @handle, or any channel URL and return the channel id."""
+        kind, value = parse_channel_ref(ref)
+        if kind == "id":
+            return value
+        if not value:
+            return None
+        cached = self._resolved.get(value.lower())
+        if cached:
+            return cached
+        cid: Optional[str] = None
+        attempts = [("forUsername", value)] if kind == "user" else [("forHandle", "@" + value)]
+        if kind == "name":
+            attempts.append(("forUsername", value))
+        for param, arg in attempts:
+            try:
+                resp = self._call(
+                    lambda c, p=param, a=arg: c.channels().list(part="id", **{p: a}).execute(),
+                    YOUTUBE_LIST_COST,
+                )
+                items = resp.get("items") or []
+                if items:
+                    cid = items[0]["id"]
+                    break
+            except Exception as exc:
+                logger.info("channels.list %s=%s failed: %s", param, arg, exc)
+        if not cid:
+            cid = _resolve_channel_via_ytdlp(ref if "youtube.com" in ref else f"https://www.youtube.com/@{value}")
+        if cid:
+            self._resolved[value.lower()] = cid
+        return cid
 
     def get_channel_info(self, channel_id: str) -> Optional[dict]:
         """Get channel info with 1-hour TTL cache."""

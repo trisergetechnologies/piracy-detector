@@ -10,12 +10,14 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from config import (
     TELEGRAM_API_HASH,
     TELEGRAM_API_ID,
     TELEGRAM_CACHE_DIR,
+    TELEGRAM_FLOOD_MAX_WAIT,
+    TELEGRAM_PARTIAL_DOWNLOAD_MB,
     TELEGRAM_SESSION,
     TELEGRAM_SESSION_STRING,
 )
@@ -51,14 +53,18 @@ def _build_client():
     from telethon import TelegramClient
     from telethon.sessions import StringSession
 
+    # Telethon sleeps through FloodWaits up to this many seconds by itself;
+    # longer ones raise FloodWaitError, which the scanner turns into a clean stop.
+    opts = {"flood_sleep_threshold": TELEGRAM_FLOOD_MAX_WAIT}
     if TELEGRAM_SESSION_STRING:
         return TelegramClient(
             StringSession(TELEGRAM_SESSION_STRING),
             TELEGRAM_API_ID,
             TELEGRAM_API_HASH,
+            **opts,
         )
     Path(TELEGRAM_SESSION).parent.mkdir(parents=True, exist_ok=True)
-    return TelegramClient(TELEGRAM_SESSION, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    return TelegramClient(TELEGRAM_SESSION, TELEGRAM_API_ID, TELEGRAM_API_HASH, **opts)
 
 
 async def _ensure_connected(client) -> bool:
@@ -83,53 +89,89 @@ def run_async(coro):
         return asyncio.run(coro)
 
 
+class FloodStop(Exception):
+    """Telegram asked us to wait longer than TELEGRAM_FLOOD_MAX_WAIT."""
+
+    def __init__(self, seconds: int, where: str = "") -> None:
+        super().__init__(f"FloodWait {seconds}s at {where}")
+        self.seconds = int(seconds)
+        self.where = where
+
+
+async def resolve_public(client, seed: dict) -> Tuple[Optional[Any], str]:
+    """Resolve a PUBLIC channel/group by username -> (entity | None, reason).
+
+    Public content only: private invite links are never imported and channels
+    are never joined. Public channels can be read without membership.
+    Raises FloodStop when Telegram demands a long wait.
+    """
+    from telethon.errors import FloodWaitError
+
+    if seed.get("kind") == "invite":
+        return None, "private_invite_not_joined"
+    username = seed.get("value")
+    if not username:
+        return None, "empty_seed"
+
+    for attempt in (1, 2):
+        try:
+            entity = await client.get_entity(username)
+            break
+        except FloodWaitError as exc:
+            if attempt == 1 and exc.seconds <= TELEGRAM_FLOOD_MAX_WAIT:
+                logger.warning("FloodWait %ss resolving %s – sleeping", exc.seconds, username)
+                await asyncio.sleep(exc.seconds + 1)
+                continue
+            raise FloodStop(exc.seconds, f"resolve:{username}")
+        except Exception as exc:
+            logger.warning("Resolve failed for %s: %s", username, exc)
+            return None, f"resolve_failed: {str(exc)[:120]}"
+
+    # Users and bots are not content channels.
+    if not (getattr(entity, "broadcast", False) or getattr(entity, "megagroup", False)
+            or getattr(entity, "gigagroup", False)):
+        return None, "not_a_public_channel"
+    if not getattr(entity, "username", None) and not getattr(entity, "usernames", None):
+        return None, "not_public"
+    return entity, ""
+
+
 async def resolve_and_join(client, seed: dict) -> Optional[Any]:
-    """Resolve a public username or try to join an invite. Returns entity or None."""
-    from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
-    from telethon.tl.functions.channels import JoinChannelRequest
-    from telethon.errors import (
-        ChannelPrivateError,
-        InviteHashExpiredError,
-        UserAlreadyParticipantError,
-        FloodWaitError,
-    )
+    """Backwards-compatible name. No longer joins anything (public read only)."""
+    entity, _reason = await resolve_public(client, seed)
+    return entity
+
+
+async def search_public_channels(client, query: str, limit: int = 20) -> List[dict]:
+    """Telegram's global search for public channels/groups by name. Returns seeds."""
+    from telethon.errors import FloodWaitError
+    from telethon.tl.functions.contacts import SearchRequest
 
     try:
-        if seed.get("kind") == "invite":
-            token = seed.get("value")
-            try:
-                await client(ImportChatInviteRequest(token))
-            except UserAlreadyParticipantError:
-                pass
-            except InviteHashExpiredError:
-                logger.warning("Invite expired: %s", token)
-                return None
-            # Re-check invite to get chat
-            try:
-                updates = await client(CheckChatInviteRequest(token))
-                chat = getattr(updates, "chat", None)
-                if chat:
-                    return chat
-            except Exception:
-                pass
-            return None
-
-        username = seed.get("value")
-        entity = await client.get_entity(username)
-        try:
-            await client(JoinChannelRequest(entity))
-        except UserAlreadyParticipantError:
-            pass
-        except ChannelPrivateError:
-            logger.warning("Channel private / cannot join: %s", username)
-            # May still read if already a member
-        return entity
+        res = await client(SearchRequest(q=query, limit=limit))
     except FloodWaitError as exc:
-        logger.warning("Flood wait %ss for seed %s", exc.seconds, seed.get("value"))
-        return None
-    except Exception as exc:
-        logger.warning("Resolve failed for %s: %s", seed.get("value"), exc)
-        return None
+        if exc.seconds <= TELEGRAM_FLOOD_MAX_WAIT:
+            await asyncio.sleep(exc.seconds + 1)
+            try:
+                res = await client(SearchRequest(q=query, limit=limit))
+            except FloodWaitError as exc2:
+                raise FloodStop(exc2.seconds, f"search:{query}")
+        else:
+            raise FloodStop(exc.seconds, f"search:{query}")
+
+    seeds: List[dict] = []
+    for chat in getattr(res, "chats", []) or []:
+        username = getattr(chat, "username", None)
+        if not username:
+            continue
+        seeds.append({
+            "kind": "public",
+            "value": username.lower(),
+            "url": f"https://t.me/{username}",
+            "source": f"search:{query}",
+            "title": getattr(chat, "title", "") or "",
+        })
+    return seeds
 
 
 async def fetch_channel_meta(client, entity) -> dict:
@@ -188,9 +230,23 @@ async def iter_recent_messages(client, entity, limit: int = 150) -> List[dict]:
                 "media": media_info,
                 "views": getattr(msg, "views", None) or 0,
                 "forwards": getattr(msg, "forwards", None) or 0,
+                "forwarded_from": _forward_source(msg),
             }
         )
     return results
+
+
+def _forward_source(msg) -> Optional[dict]:
+    """Public channel a message was forwarded from (None if not a forward / not public)."""
+    try:
+        fwd = getattr(msg, "forward", None)
+        chat = getattr(fwd, "chat", None) if fwd else None
+        username = getattr(chat, "username", None) if chat else None
+        if username:
+            return {"username": username.lower(), "title": getattr(chat, "title", "") or ""}
+    except Exception:
+        pass
+    return None
 
 
 def _describe_media(msg) -> Optional[dict]:
@@ -248,16 +304,31 @@ async def download_media_sample(
     entity,
     message_id: int,
     dest_dir: Optional[str] = None,
+    max_bytes: Optional[int] = None,
 ) -> Optional[str]:
-    """Download a message's media to cache. Returns file path or None."""
+    """Download only the first part of a message's media (enough for an audio
+    sample). Returns file path or None. Raises FloodStop on a long FloodWait."""
+    from telethon.errors import FloodWaitError
+
+    if max_bytes is None:
+        max_bytes = TELEGRAM_PARTIAL_DOWNLOAD_MB * 1024 * 1024
     dest = Path(dest_dir or TELEGRAM_CACHE_DIR) / "media"
     dest.mkdir(parents=True, exist_ok=True)
+    path = dest / f"{entity.id}_{message_id}.part"
     try:
         msg = await client.get_messages(entity, ids=message_id)
         if not msg or not msg.media:
             return None
-        path = await client.download_media(msg, file=str(dest / f"{entity.id}_{message_id}"))
-        return str(path) if path else None
+        written = 0
+        with open(path, "wb") as fh:
+            async for chunk in client.iter_download(msg.media, request_size=512 * 1024):
+                fh.write(chunk)
+                written += len(chunk)
+                if written >= max_bytes:
+                    break
+        return str(path) if written else None
+    except FloodWaitError as exc:
+        raise FloodStop(exc.seconds, f"download:{message_id}")
     except Exception as exc:
         logger.warning("Media download failed msg=%s: %s", message_id, exc)
         return None

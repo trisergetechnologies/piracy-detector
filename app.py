@@ -43,6 +43,7 @@ GET  /health               – service health
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import traceback
@@ -54,15 +55,20 @@ from flask_cors import CORS
 
 import db
 from config import (
+    BENCHMARK_RESULT_FILE,
     DEFAMATORY_BIG_CHANNEL_MIN_CONFIDENCE,
     DEFAMATORY_BIG_CHANNEL_THRESHOLD,
     DEFAULT_MAX_RESULTS,
+    ENRICH_MAX_VIDEOS,
+    FEEDBACK_MAX_CHANNELS,
+    FEEDBACK_MAX_TITLE_QUERIES,
     FINGERPRINT_ENABLED,
     MIN_CONFIDENCE,
     MONITOR_DEFAULT_INTERVAL_HOURS,
     TAKEDOWN_REQUIRE_CONFIRMED,
     THUMBNAIL_ANALYSIS_ENABLED,
 )
+from core import funnel
 from core.catalog import ingest_official_catalog
 from core.content_analyzer import (
     analyze_thumbnail,
@@ -137,6 +143,80 @@ def _parse_date(raw: Optional[str]) -> Optional[str]:
     return None
 
 
+def _feedback_from_confirmed(entity_name: str) -> Dict[str, List[str]]:
+    """Search-set feedback: channels and titles of hits already confirmed
+    (by content match or by a reviewer) feed the next scan. Read-only use of
+    the existing detected_videos collection."""
+    channels: List[str] = []
+    titles: List[str] = []
+    tg_channels: List[str] = []
+    try:
+        rows = db.list_detected_for_entity(entity_name, limit=500)
+    except Exception as exc:
+        logger.warning("Feedback lookup failed: %s", exc)
+        return {"channels": [], "titles": [], "telegram": []}
+    for row in rows:
+        if row.get("review_status") == "false_positive":
+            continue
+        reason = str((row.get("score_result") or {}).get("reason") or "")
+        if row.get("review_status") != "confirmed" and not reason.startswith("CONFIRMED:"):
+            continue
+        if (row.get("platform") or "youtube") == "telegram":
+            url = row.get("channel_url") or ""
+            if url and url not in tg_channels:
+                tg_channels.append(url)
+            continue
+        cid = row.get("channel_id") or ""
+        if cid and cid not in channels:
+            channels.append(cid)
+        title = " ".join(str(row.get("title") or "").split()[:8])
+        if len(title) >= 8 and title not in titles:
+            titles.append(title)
+    return {
+        "channels": channels[:FEEDBACK_MAX_CHANNELS],
+        "titles": titles[:FEEDBACK_MAX_TITLE_QUERIES],
+        "telegram": tg_channels[:FEEDBACK_MAX_CHANNELS],
+    }
+
+
+def _benchmark_snapshot() -> dict:
+    """Last benchmark result (written by scripts/benchmark.py), if any."""
+    try:
+        with open(BENCHMARK_RESULT_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return {k: data.get(k) for k in ("run_at", "recall", "precision", "positives", "negatives")}
+    except Exception:
+        return {"recall": None, "note": "not measured yet - see scripts/benchmark.py"}
+
+
+def _scan_warnings(fn: funnel.Funnel, catalog: dict, wanted_catalog: bool) -> List[str]:
+    """Plain-language reasons a scan may have missed content."""
+    out: List[str] = []
+    errors = fn.errors
+    if errors.get("llm_auth_or_billing") or errors.get("llm_skipped_breaker_open"):
+        out.append(
+            "AI classifier unavailable (OpenAI key invalid or out of credits): "
+            + fn.error_samples.get("llm_auth_or_billing", "")[:160]
+            + " - results rely on catalog/content evidence only."
+        )
+    if catalog.get("unresolved"):
+        out.append("Official channels/playlists not found: " + ", ".join(catalog["unresolved"]))
+    if wanted_catalog and not catalog.get("entries"):
+        out.append("Official catalog is empty, so content matching (transcript/audio) could not run.")
+    elif not wanted_catalog:
+        out.append("No official channel/playlist given: only metadata evidence was possible (weak tier).")
+    if errors.get("transcript_rate_limited"):
+        out.append(
+            "YouTube rate-limited caption downloads (HTTP 429): some transcript checks were "
+            "skipped this run. Fetched transcripts are cached, so the next scan continues."
+        )
+    if errors.get("youtube_api_quota"):
+        out.append("YouTube API quota/rate limit hit; paid search was cut short (free sources still ran).")
+    if errors.get("telegram_floodwait"):
+        out.append("Telegram rate limit (FloodWait): remaining channels are scanned first on the next run.")
+    return out
+
+
 def _do_scan_work(
     scan_id: str,
     entity_name: str,
@@ -154,9 +234,13 @@ def _do_scan_work(
     enable_fingerprinting: bool = True,
 ) -> None:
     """Heavy scan work that runs in a background thread."""
+    fn = funnel.start(scan_id, "youtube", entity_name)
     try:
         logger.info("=== Scan %s started: %s (%s) [%s] ===", scan_id, entity_name, entity_type, scan_type)
         fp_summary: dict = {"enabled": False, "matches": 0}
+        want_defamatory = scan_type in ("both", "defamatory")
+        want_piracy = scan_type in ("both", "piracy")
+        wanted_catalog = bool(official_channel_ids or official_playlist_ids)
 
         # ----- Phase 0: Official catalog (rights-holder reference) -----
         catalog: dict = {
@@ -164,8 +248,10 @@ def _do_scan_work(
             "channel_ids": set(),
             "entries": [],
             "title_index": [],
+            "duration_map": {},
+            "unresolved": [],
         }
-        if scan_type in ("both", "piracy") and (official_channel_ids or official_playlist_ids):
+        if want_piracy and wanted_catalog:
             db.update_scan_progress(scan_id, "Ingesting official content catalog...")
             catalog = ingest_official_catalog(
                 yt_client,
@@ -178,8 +264,14 @@ def _do_scan_work(
                 len(catalog.get("channel_ids") or []),
             )
 
-        # ----- Phase 1: Discovery (anti-viral + deep crawl) -----
-        db.update_scan_progress(scan_id, "Discovering videos (anti-viral + deep crawl)...")
+        # ----- Feedback: confirmed hits widen the search set -----
+        feedback = _feedback_from_confirmed(entity_name) if want_piracy else {"channels": [], "titles": []}
+        known_all = list(known_channels or [])
+        known_all += [c for c in feedback["channels"] if c not in known_all]
+        fn.note("feedback", {"channels": len(feedback["channels"]), "title_queries": len(feedback["titles"])})
+
+        # ----- Phase 1: Discovery -----
+        db.update_scan_progress(scan_id, "Discovering videos (search + date-ordered + channel crawl)...")
         raw_videos = discover_videos(
             entity_name=entity_name,
             entity_type=entity_type,
@@ -187,10 +279,11 @@ def _do_scan_work(
             date_from=date_from,
             date_to=date_to,
             max_results_per_query=30,
-            known_channel_ids=known_channels or None,
+            known_channel_ids=known_all or None,
             yt_client=yt_client,
             catalog=catalog,
-            enable_deep_crawl=enable_deep_crawl and scan_type in ("both", "piracy"),
+            enable_deep_crawl=enable_deep_crawl and want_piracy,
+            extra_queries=feedback["titles"],
         )
         logger.info("Phase 1 complete: %d raw videos discovered", len(raw_videos))
 
@@ -201,23 +294,44 @@ def _do_scan_work(
                 "pirated_found": 0,
                 "legitimate_filtered": 0,
                 "catalog_videos": len(catalog.get("video_ids") or []),
+                "warnings": _scan_warnings(fn, catalog, wanted_catalog)
+                + ["No candidate videos were returned by any search source."],
+                "diagnostics": fn.compact(),
+                "benchmark": _benchmark_snapshot(),
             }
             db.complete_scan(scan_id, summary)
             return
 
-        # Soft cap before enrichment (heuristics will re-prioritize after)
-        enrich_cap = min(max(max_results * 2, max_results), 500)
-        raw_videos = raw_videos[:enrich_cap]
+        # ----- Phase 1a: rank by evidence BEFORE any cut (never by discovery order) -----
+        raw_videos = annotate_and_prioritize(
+            raw_videos, catalog=catalog, drop_official=want_piracy, entity_name=entity_name,
+        )
+        if len(raw_videos) > ENRICH_MAX_VIDEOS:
+            fn.drop_many([v["video_id"] for v in raw_videos[ENRICH_MAX_VIDEOS:]], "cap", "enrich_cap")
+            raw_videos = raw_videos[:ENRICH_MAX_VIDEOS]
 
-        # ----- Phase 1b: Enrich via YouTube Data API -----
+        # ----- Phase 1b: Enrich via YouTube Data API (1 unit per 50 videos) -----
         db.update_scan_progress(scan_id, f"Enriching {len(raw_videos)} videos...")
         video_ids = [v["video_id"] for v in raw_videos]
-        video_details_list = yt_client.get_video_details(video_ids)
+        enrich_ok = True
+        try:
+            video_details_list = yt_client.get_video_details(video_ids)
+        except Exception as exc:
+            # Keep going on search metadata rather than losing the whole scan.
+            enrich_ok = False
+            video_details_list = []
+            logger.error("Enrichment failed, continuing with search metadata: %s", exc)
+            fn.error("youtube_api_enrich", str(exc))
         video_details_map: Dict[str, dict] = {v["id"]: v for v in video_details_list}
 
         channel_ids_needed: set[str] = set()
+        enriched: List[dict] = []
         for v in raw_videos:
-            detail = video_details_map.get(v["video_id"], {})
+            detail = video_details_map.get(v["video_id"])
+            if detail is None and enrich_ok:
+                fn.drop(v["video_id"], "enrich", "video_unavailable")  # deleted / private
+                continue
+            detail = detail or {}
             snippet = detail.get("snippet", {})
             stats = detail.get("statistics", {})
             cd = detail.get("contentDetails", {})
@@ -225,45 +339,48 @@ def _do_scan_work(
             v["title"] = v.get("title") or snippet.get("title", "")
             v["channel_id"] = v.get("channel_id") or snippet.get("channelId", "")
             v["channel_title"] = v.get("channel_title") or snippet.get("channelTitle", "")
-            v["description"] = v.get("description") or snippet.get("description", "")
+            # Search results carry a truncated description; prefer the full one.
+            v["description"] = snippet.get("description") or v.get("description") or ""
             v["tags"] = snippet.get("tags", [])
-            v["published_at"] = v.get("published_at") or snippet.get("publishedAt", "")
+            v["published_at"] = snippet.get("publishedAt") or v.get("published_at") or ""
             v["thumbnail_url"] = v.get("thumbnail_url") or snippet.get("thumbnails", {}).get("high", {}).get("url", "")
             v["view_count"] = safe_int(stats.get("viewCount"))
             v["like_count"] = safe_int(stats.get("likeCount"))
             v["comment_count"] = safe_int(stats.get("commentCount"))
-            dur = parse_duration(cd.get("duration", ""))
+            dur = parse_duration(cd.get("duration", "")) or safe_int(v.get("duration_seconds"))
             v["duration_seconds"] = dur
             v["duration_formatted"] = format_duration(dur)
 
             if v["channel_id"]:
                 channel_ids_needed.add(v["channel_id"])
+            enriched.append(v)
+        raw_videos = enriched
 
-        channel_map: Dict[str, dict] = yt_client.get_channels_batch(list(channel_ids_needed))
+        try:
+            channel_map: Dict[str, dict] = yt_client.get_channels_batch(list(channel_ids_needed))
+        except Exception as exc:
+            channel_map = {}
+            fn.error("youtube_api_channels", str(exc))
         logger.info("Phase 1b complete: enriched %d videos, %d channels", len(raw_videos), len(channel_map))
+        fn.stage("enriched", len(raw_videos))
 
-        # ----- Phase 1c: Cheap heuristics – prioritize low-view likely pirates -----
-        db.update_scan_progress(scan_id, "Prioritizing low-view / catalog-similar candidates...")
-        drop_official = scan_type in ("both", "piracy")
+        # ----- Phase 1c: re-rank with full metadata, then cut to the analysis budget -----
+        db.update_scan_progress(scan_id, "Ranking candidates by evidence (titles, durations, links)...")
         raw_videos = annotate_and_prioritize(
-            raw_videos,
-            catalog=catalog,
-            channel_map=channel_map,
-            drop_official=drop_official,
+            raw_videos, catalog=catalog, drop_official=want_piracy, entity_name=entity_name,
         )
-        raw_videos = raw_videos[:max_results]
+        if len(raw_videos) > max_results:
+            for v in raw_videos[max_results:]:
+                fn.drop(v["video_id"], "cap", "max_results",
+                        heuristic_score=(v.get("heuristic") or {}).get("heuristic_score"))
+            raw_videos = raw_videos[:max_results]
+        fn.stage("after_filters", len(raw_videos))
         # Keep video_details_map aligned with trimmed set
         keep_ids = {v["video_id"] for v in raw_videos}
         video_details_map = {k: v for k, v in video_details_map.items() if k in keep_ids}
 
-        # ----- Phase 1d: Audio fingerprint matching (Phase B) -----
-        do_fp = (
-            enable_fingerprinting
-            and FINGERPRINT_ENABLED
-            and scan_type in ("both", "piracy")
-            and bool(catalog.get("entries"))
-        )
-        if do_fp:
+        # ----- Phase 1d: content verification (transcript, then audio fingerprint) -----
+        if want_piracy and catalog.get("entries"):
             def _fp_progress(msg: str) -> None:
                 db.update_scan_progress(scan_id, msg)
 
@@ -271,6 +388,7 @@ def _do_scan_work(
                 catalog=catalog,
                 candidates=raw_videos,
                 progress_cb=_fp_progress,
+                audio=enable_fingerprinting and FINGERPRINT_ENABLED,
             )
             # Persist fingerprints for reuse across scans
             for v in raw_videos:
@@ -280,25 +398,16 @@ def _do_scan_work(
                         db.save_fingerprint(v["video_id"], fp)
                     except Exception:
                         pass
-            logger.info(
-                "Phase 1d fingerprinting: %s",
-                {k: fp_summary.get(k) for k in (
-                    "catalog_fingerprinted", "candidates_tested",
-                    "matches", "strong_matches", "skipped_reason",
-                )},
-            )
+            logger.info("Phase 1d content matching: %s", fp_summary)
         else:
             fp_summary = {
                 "enabled": False,
                 "matches": 0,
-                "skipped_reason": (
-                    "disabled"
-                    if not enable_fingerprinting or not FINGERPRINT_ENABLED
-                    else "no_official_catalog"
-                ),
+                "skipped_reason": "no_official_catalog" if want_piracy else "not_a_piracy_scan",
             }
+        fn.stage("verified", sum(1 for v in raw_videos if (v.get("fingerprint_match") or {}).get("is_match")))
 
-        # ----- Phase 2: AI Classification -----
+        # ----- Phase 2: AI Classification (one signal among several) -----
         db.update_scan_progress(scan_id, f"Classifying {len(raw_videos)} videos with AI...")
         text_results = batch_classify_text(
             raw_videos, entity_name, entity_type, scan_type, channel_map
@@ -327,21 +436,23 @@ def _do_scan_work(
         defamatory: List[dict] = []
         pirated: List[dict] = []
         legitimate_count = 0
+        tiers = {"confirmed": 0, "likely": 0, "weak": 0}
+        weak_not_saved = 0
 
-        want_defamatory = scan_type in ("both", "defamatory")
-        want_piracy = scan_type in ("both", "piracy")
-
-        for v in scored:
+        for v, txt in zip(scored, text_results):
             sr = v.get("score_result", {})
             cls = sr.get("classification", "LEGITIMATE")
             conf = sr.get("confidence", 0)
+            tier = str(sr.get("reason") or "").split(":", 1)[0].lower() if cls == "PIRATED" else ""
 
             # Skip classifications that don't match the requested scan_type
             if cls == "DEFAMATORY" and not want_defamatory:
                 legitimate_count += 1
+                fn.drop(v["video_id"], "classify", "defamatory_not_requested")
                 continue
             if cls == "PIRATED" and not want_piracy:
                 legitimate_count += 1
+                fn.drop(v["video_id"], "classify", "piracy_not_requested")
                 continue
 
             # Safety net: if the channel is large and the LLM said DEFAMATORY,
@@ -359,6 +470,7 @@ def _do_scan_work(
                             DEFAMATORY_BIG_CHANNEL_MIN_CONFIDENCE,
                         )
                         legitimate_count += 1
+                        fn.drop(v["video_id"], "classify", "defamatory_big_channel")
                         continue
 
             if cls == "DEFAMATORY" and conf >= min_conf:
@@ -376,6 +488,8 @@ def _do_scan_work(
                 v["platform"] = v.get("platform") or "youtube"
                 v["review_status"] = v.get("review_status") or "pending"
                 pirated.append(v)
+                if tier in tiers:
+                    tiers[tier] += 1
                 db.save_detected_video(scan_id, {**v, "entity_name": entity_name})
                 if v.get("channel_id"):
                     db.upsert_channel(v["channel_id"], {
@@ -385,6 +499,21 @@ def _do_scan_work(
                     })
             else:
                 legitimate_count += 1
+                if cls == "PIRATED":
+                    # Weak match under the confidence threshold: not saved, but never silent.
+                    weak_not_saved += 1
+                    fn.drop(v["video_id"], "threshold", "below_min_confidence", confidence=conf)
+                    fn.weak_match({
+                        "video_id": v["video_id"], "title": v.get("title"),
+                        "channel_title": v.get("channel_title"),
+                        "confidence": conf, "reason": sr.get("reason"),
+                    })
+                elif txt.get("llm_error"):
+                    fn.drop(v["video_id"], "classify", "llm_unavailable_and_no_other_evidence")
+                elif cls == "DEFAMATORY":
+                    fn.drop(v["video_id"], "threshold", "below_min_confidence", confidence=conf)
+                else:
+                    fn.drop(v["video_id"], "classify", "no_piracy_evidence")
 
         # Phase C bridge: harvest Telegram seeds from piracy-relevant descriptions
         tg_seed_count = 0
@@ -404,25 +533,35 @@ def _do_scan_work(
         fresh = filter_truly_new_hits(entity_name, all_flagged, scan_id)
         alerts_created = emit_new_hit_alerts(scan_id, entity_name, fresh, platform="youtube")
 
+        fn.stage("confirmed", tiers["confirmed"])
+        fn.stage("flagged", len(all_flagged))
         summary = {
             "total_analyzed": len(scored),
             "defamatory_found": len(defamatory),
             "pirated_found": len(pirated),
             "legitimate_filtered": legitimate_count,
             "catalog_videos": len(catalog.get("video_ids") or []),
-            "deep_crawl_enabled": bool(enable_deep_crawl and scan_type in ("both", "piracy")),
+            "deep_crawl_enabled": bool(enable_deep_crawl and want_piracy),
             "fingerprint": fp_summary,
             "telegram_seeds_harvested": tg_seed_count,
             "new_alerts": alerts_created,
+            "tiers": {**tiers, "weak_below_threshold": weak_not_saved},
+            "warnings": _scan_warnings(fn, catalog, wanted_catalog) if want_piracy else [],
+            "diagnostics": fn.compact(),
         }
+        if not pirated and want_piracy:
+            summary["benchmark"] = _benchmark_snapshot()
         db.complete_scan(scan_id, summary)
 
-        logger.info("=== Scan %s done: %d defamatory, %d pirated, %d legitimate ===",
-                     scan_id, len(defamatory), len(pirated), legitimate_count)
+        logger.info("=== Scan %s done: %d defamatory, %d pirated %s, %d legitimate ===",
+                     scan_id, len(defamatory), len(pirated), tiers, legitimate_count)
 
     except Exception as exc:
         logger.error("Scan %s failed: %s\n%s", scan_id, exc, traceback.format_exc())
-        db.complete_scan(scan_id, {"error": str(exc)})
+        fn.error("scan_failed", str(exc))
+        db.complete_scan(scan_id, {"error": str(exc), "diagnostics": fn.compact()})
+    finally:
+        fn.save()
 
 
 def _do_telegram_scan_work(
@@ -437,6 +576,7 @@ def _do_telegram_scan_work(
     official_telegram: Any = None,
 ) -> None:
     """Background Telegram scan (Phase C)."""
+    fn = funnel.start(scan_id, "telegram", entity_name)
     try:
         logger.info("=== Telegram scan %s started: %s ===", scan_id, entity_name)
         db.update_scan_progress(scan_id, "Preparing Telegram seeds...")
@@ -449,15 +589,27 @@ def _do_telegram_scan_work(
                 f"Bridging {len(youtube_videos)} YouTube hits → Telegram seeds...",
             )
 
+        # Channels of earlier confirmed Telegram hits are always re-checked (feedback).
+        feedback = _feedback_from_confirmed(entity_name)
+        if feedback["telegram"]:
+            if isinstance(manual_seeds, str):
+                manual_seeds = [manual_seeds]
+            manual_seeds = list(manual_seeds or []) + feedback["telegram"]
+
+        # Official catalog: titles + durations are matched against posted files even
+        # when audio fingerprinting is off.
+        catalog: Optional[dict] = None
         catalog_fp_index: List[dict] = []
-        if enable_fingerprinting and (official_channel_ids or official_playlist_ids):
-            db.update_scan_progress(scan_id, "Building official fingerprint index for TG media...")
+        if official_channel_ids or official_playlist_ids:
+            db.update_scan_progress(scan_id, "Loading official catalog (titles, durations)...")
             catalog = ingest_official_catalog(
                 yt_client,
                 official_channel_ids=official_channel_ids,
                 official_playlist_ids=official_playlist_ids,
             )
-            catalog_fp_index = build_catalog_fingerprints(catalog)
+            if enable_fingerprinting and FINGERPRINT_ENABLED and catalog.get("entries"):
+                db.update_scan_progress(scan_id, "Building official fingerprint index for TG media...")
+                catalog_fp_index = build_catalog_fingerprints(catalog)
 
         def _prog(msg: str) -> None:
             db.update_scan_progress(scan_id, msg)
@@ -470,6 +622,7 @@ def _do_telegram_scan_work(
             enable_fingerprinting=enable_fingerprinting,
             official_telegram=official_telegram,
             progress_cb=_prog,
+            catalog=catalog,
         )
 
         if result.get("seeds"):
@@ -480,9 +633,21 @@ def _do_telegram_scan_work(
         hits = result.get("hits") or []
         saved = 0
         saved_hits: List[dict] = []
+        tiers = {"confirmed": 0, "likely": 0, "weak": 0}
         for hit in hits:
+            tier = str(hit.get("reason") or "").split(":", 1)[0].lower()
             if int(hit.get("confidence") or 0) < min_conf:
+                # Weak match under the threshold: logged with its reason, not saved.
+                fn.drop(hit.get("video_id"), "threshold", "below_min_confidence",
+                        confidence=hit.get("confidence"))
+                fn.weak_match({
+                    "video_id": hit.get("video_id"), "url": hit.get("url"),
+                    "channel_title": hit.get("channel_title"),
+                    "confidence": hit.get("confidence"), "reason": hit.get("reason"),
+                })
                 continue
+            if tier in tiers:
+                tiers[tier] += 1
             # Normalize into detected_videos shape
             record = {
                 **hit,
@@ -513,26 +678,41 @@ def _do_telegram_scan_work(
             scan_id, entity_name, fresh, platform="telegram"
         )
 
+        stats = result.get("stats") or {}
+        fn.stage("after_filters", stats.get("channels_scanned", 0))
+        fn.stage("verified", stats.get("fingerprint_matches", 0))
+        fn.stage("confirmed", tiers["confirmed"])
+        fn.stage("flagged", saved)
+        warnings = _scan_warnings(fn, catalog or {}, bool(official_channel_ids or official_playlist_ids))
+        if result.get("warning"):
+            warnings.append(result["warning"])
+
         summary = {
             "platform": "telegram",
             "mode": result.get("mode"),
-            "total_analyzed": (result.get("stats") or {}).get("messages_scanned", 0),
+            "total_analyzed": stats.get("messages_scanned", 0),
             "defamatory_found": 0,
             "pirated_found": saved,
             "legitimate_filtered": max(len(hits) - saved, 0),
             "new_alerts": alerts_created,
+            "tiers": {**tiers, "weak_below_threshold": max(len(hits) - saved, 0)},
+            "warnings": warnings,
+            "diagnostics": fn.compact(),
             "telegram": {
                 "seeds": len(result.get("seeds") or []),
                 "discovered_seeds": len(result.get("discovered_seeds") or []),
                 "official_telegram": result.get("official_telegram") or [],
-                "channels_scanned": (result.get("stats") or {}).get("channels_scanned", 0),
-                "fingerprint_matches": (result.get("stats") or {}).get("fingerprint_matches", 0),
-                "official_channels_skipped_hits": (result.get("stats") or {}).get(
+                "channels_scanned": stats.get("channels_scanned", 0),
+                "channels_inaccessible": stats.get("channels_inaccessible", 0),
+                "channels_deferred": stats.get("channels_deferred", 0),
+                "search_queries": stats.get("search_queries", 0),
+                "search_channels_found": stats.get("search_channels_found", 0),
+                "stopped_reason": stats.get("stopped_reason"),
+                "fingerprint_matches": stats.get("fingerprint_matches", 0),
+                "official_channels_skipped_hits": stats.get(
                     "official_channels_skipped_hits", 0
                 ),
-                "soft_signals_ignored": (result.get("stats") or {}).get(
-                    "soft_signals_ignored", 0
-                ),
+                "soft_signals_ignored": stats.get("soft_signals_ignored", 0),
                 "youtube_bridge_seeds": result.get("youtube_bridge_seeds", 0),
                 "warning": result.get("warning"),
                 "error": result.get("error"),
@@ -550,17 +730,23 @@ def _do_telegram_scan_work(
                 ],
             },
         }
+        if not saved:
+            summary["benchmark"] = _benchmark_snapshot()
         if result.get("error") and result.get("mode") != "seeds_only":
             summary["error"] = result["error"]
 
         db.complete_scan(scan_id, summary)
         logger.info(
-            "=== Telegram scan %s done: mode=%s hits=%d saved=%d ===",
-            scan_id, result.get("mode"), len(hits), saved,
+            "=== Telegram scan %s done: mode=%s hits=%d saved=%d %s ===",
+            scan_id, result.get("mode"), len(hits), saved, tiers,
         )
     except Exception as exc:
         logger.error("Telegram scan %s failed: %s\n%s", scan_id, exc, traceback.format_exc())
-        db.complete_scan(scan_id, {"error": str(exc), "platform": "telegram"})
+        fn.error("scan_failed", str(exc))
+        db.complete_scan(scan_id, {"error": str(exc), "platform": "telegram",
+                                   "diagnostics": fn.compact()})
+    finally:
+        fn.save()
 
 
 def _start_scan(scan_type: str) -> tuple[Response, int]:

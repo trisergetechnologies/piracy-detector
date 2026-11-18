@@ -332,6 +332,142 @@ MONITOR_ENABLED = os.environ.get("MONITOR_ENABLED", "true").lower() in (
 MONITOR_TICK_SECONDS = int(os.environ.get("MONITOR_TICK_SECONDS", "60"))
 # Default re-scan interval for a new monitor (hours)
 MONITOR_DEFAULT_INTERVAL_HOURS = int(os.environ.get("MONITOR_DEFAULT_INTERVAL_HOURS", "24"))
+# =============================================================================
+# Detection quality – ranking, budgets, verification, query expansion
+# =============================================================================
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# videos.list costs 1 unit per 50 ids, so enrich (almost) everything discovered.
+ENRICH_MAX_VIDEOS = _env_int("ENRICH_MAX_VIDEOS", 2000)
+# search.list units one scan may spend (100 per call). Free yt-dlp/RSS run first.
+YOUTUBE_SEARCH_BUDGET_PER_SCAN = _env_int("YOUTUBE_SEARCH_BUDGET_PER_SCAN", 2000)
+# Free date-ordered yt-dlp searches (surface fresh, low-view uploads).
+YTDLP_DATE_SEARCH_QUERIES = _env_int("YTDLP_DATE_SEARCH_QUERIES", 20)
+# Parallel yt-dlp searches (keep small to stay polite).
+YTDLP_SEARCH_WORKERS = _env_int("YTDLP_SEARCH_WORKERS", 4)
+# search.list date windows in days back from now (0 = all time), newest uploads first.
+YOUTUBE_SEARCH_WINDOWS_DAYS = tuple(
+    int(x) for x in os.environ.get("YOUTUBE_SEARCH_WINDOWS_DAYS", "7,30,180,0").split(",") if x.strip().isdigit()
+)
+# Brand queries sent to the paid search.list API ({name} only; budget-capped).
+YOUTUBE_API_QUERY_TEMPLATES = [
+    "{name}", "{name} full lecture", "{name} free", "{name} telegram", "{name} batch",
+]
+# Official titles (spread over the whole catalog) turned into search queries.
+CATALOG_QUERY_TITLES = _env_int("CATALOG_QUERY_TITLES", 25)
+# Confirmed-hit titles re-used as queries on later scans (feedback).
+FEEDBACK_MAX_TITLE_QUERIES = _env_int("FEEDBACK_MAX_TITLE_QUERIES", 10)
+# Channels of confirmed hits that are re-crawled on later scans (feedback).
+FEEDBACK_MAX_CHANNELS = _env_int("FEEDBACK_MAX_CHANNELS", 15)
+# Written by scripts/benchmark.py; shown in the summary of empty runs.
+BENCHMARK_RESULT_FILE = os.environ.get(
+    "BENCHMARK_RESULT_FILE", os.path.join(os.path.dirname(__file__), "data", "benchmark_last.json")
+)
+
+# Transcript matching (YouTube captions via yt-dlp metadata; no media download)
+TRANSCRIPT_ENABLED = os.environ.get("TRANSCRIPT_ENABLED", "true").lower() in ("1", "true", "yes")
+TRANSCRIPT_MAX_CATALOG = _env_int("TRANSCRIPT_MAX_CATALOG", 120)
+TRANSCRIPT_MAX_CANDIDATES = _env_int("TRANSCRIPT_MAX_CANDIDATES", 80)
+TRANSCRIPT_WORKERS = _env_int("TRANSCRIPT_WORKERS", 2)
+# YouTube rate-limits caption downloads per IP: pace them, and pause after repeated 429s.
+TRANSCRIPT_MIN_INTERVAL_SECONDS = _env_float("TRANSCRIPT_MIN_INTERVAL_SECONDS", 2.0)
+TRANSCRIPT_BACKOFF_SECONDS = _env_int("TRANSCRIPT_BACKOFF_SECONDS", 1800)
+TRANSCRIPT_LANGS = tuple(
+    x.strip() for x in os.environ.get("TRANSCRIPT_LANGS", "hi,en").split(",") if x.strip()
+)
+# Share of sampled 4-word shingles in common (untuned defaults; tune on benchmark).
+TRANSCRIPT_CONFIRMED_OVERLAP = _env_float("TRANSCRIPT_CONFIRMED_OVERLAP", 0.40)
+TRANSCRIPT_LIKELY_OVERLAP = _env_float("TRANSCRIPT_LIKELY_OVERLAP", 0.20)
+TRANSCRIPT_MIN_SHARED = _env_int("TRANSCRIPT_MIN_SHARED", 12)
+# "No captions" is re-checked after this long (auto-captions appear hours after upload).
+TRANSCRIPT_NEGATIVE_TTL_HOURS = _env_int("TRANSCRIPT_NEGATIVE_TTL_HOURS", 72)
+
+# LLM circuit breaker: after N auth/billing failures in a row, skip the LLM for a while.
+LLM_BREAKER_FAILURES = _env_int("LLM_BREAKER_FAILURES", 3)
+LLM_BREAKER_SECONDS = _env_int("LLM_BREAKER_SECONDS", 900)
+
+# Suspects are sampled longer than official videos so the official opening is
+# still found when the copy starts with its own intro.
+FINGERPRINT_CANDIDATE_SAMPLE_SECONDS = _env_int("FINGERPRINT_CANDIDATE_SAMPLE_SECONDS", 240)
+# Spectral fallback (used when fpcalc is not installed): never more than "likely".
+# Measured on data/sample_*.csv: unrelated audio <= 0.57, aligned re-uploads >= 0.78.
+FINGERPRINT_SPECTRAL_THRESHOLD = _env_float("FINGERPRINT_SPECTRAL_THRESHOLD", 0.70)
+
+# Per-run funnel logs (JSON, one file per scan)
+FUNNEL_LOG_DIR = os.environ.get(
+    "FUNNEL_LOG_DIR", os.path.join(os.path.dirname(__file__), "logs", "funnel")
+)
+
+# Hindi / Hinglish piracy phrasings ({name} = brand, course or instructor).
+PIRACY_HINGLISH_TEMPLATES = [
+    "{name} free me",
+    "{name} free mein",
+    "{name} poora course",
+    "{name} pura course free",
+    "{name} sabhi lecture",
+    "{name} saare lecture",
+    "{name} paid batch free",
+    "{name} mirror",
+    "{name} download",
+    "{name} फ्री",
+    "{name} पूरा कोर्स",
+    "{name} लेक्चर",
+    "{name} बैच",
+]
+# Title/description words that mark a re-upload (English + Hinglish + Hindi).
+PIRACY_TITLE_KEYWORDS = [
+    "full lecture", "complete course", "full course", "batch", "leaked", "free course",
+    "telegram", "class recording", "one shot", "full chapter", "recorded class",
+    "paid course", "free download", "all lectures",
+    "free me", "free mein", "pura course", "poora course", "saare lecture", "sabhi lecture",
+    "फ्री", "पूरा कोर्स", "लेक्चर", "बैच",
+]
+# Official vs. suspect duration tolerance (seconds or fraction, whichever is larger).
+DURATION_MATCH_TOLERANCE_SECONDS = _env_int("DURATION_MATCH_TOLERANCE_SECONDS", 4)
+DURATION_MATCH_TOLERANCE_RATIO = _env_float("DURATION_MATCH_TOLERANCE_RATIO", 0.01)
+
+# Suffixes applied to misspelled / transliterated name variants.
+QUERY_VARIANT_SUFFIXES = ["full lecture", "free", "batch", "telegram"]
+QUERY_MAX_NAME_VARIANTS = _env_int("QUERY_MAX_NAME_VARIANTS", 4)
+
+# Telegram public search + crawl
+TELEGRAM_SEARCH_SUFFIXES = ["", "free", "batch", "lectures", "notes", "leaked", "course", "mirror", "download"]
+TELEGRAM_MAX_SEARCH_QUERIES = _env_int("TELEGRAM_MAX_SEARCH_QUERIES", 20)
+TELEGRAM_SEARCH_DELAY_SECONDS = _env_float("TELEGRAM_SEARCH_DELAY_SECONDS", 2.0)
+# FloodWait up to this many seconds is slept through; longer stops the run (resumes next scan).
+TELEGRAM_FLOOD_MAX_WAIT = _env_int("TELEGRAM_FLOOD_MAX_WAIT", 60)
+# Only the first N MB of a file are downloaded for verification.
+TELEGRAM_PARTIAL_DOWNLOAD_MB = _env_int("TELEGRAM_PARTIAL_DOWNLOAD_MB", 12)
+# In a channel that only names the rights holder in its title/about, keep this many
+# unverified file hits (the rest are counted in the funnel log, not saved).
+TELEGRAM_WEAK_CONTEXT_HITS_PER_CHANNEL = _env_int("TELEGRAM_WEAK_CONTEXT_HITS_PER_CHANNEL", 5)
+# Extra redistribution wording for Telegram posts (Hinglish/Hindi + common bait).
+TELEGRAM_EXTRA_DUMP_KEYWORDS = [
+    "free batch", "paid batch", "free me", "free mein", "pura course", "poora course",
+    "saare lecture", "sabhi lecture", "all lectures", "lectures free",
+    "direct download", "download link", "फ्री", "पूरा कोर्स",
+]
+# Words too generic to count as an entity mention.
+TELEGRAM_TERM_STOPWORDS = {
+    "by", "the", "and", "for", "sir", "mam", "maam", "dr", "of", "with", "official",
+    "academy", "classes", "class", "education", "educators", "institute", "coaching",
+    "excellence", "tutorials", "study", "learning", "grow", "finance", "commerce",
+}
+
 # Only include confirmed hits in takedown packs by default (pending still optional)
 TAKEDOWN_REQUIRE_CONFIRMED = os.environ.get(
     "TAKEDOWN_REQUIRE_CONFIRMED", "false"

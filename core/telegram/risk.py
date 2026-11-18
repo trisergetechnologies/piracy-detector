@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from config import TELEGRAM_EXTRA_DUMP_KEYWORDS
+
 # Strong dump / redistribution signals (not normal educator marketing).
 _DUMP_KWS = (
     "free course",
@@ -29,7 +31,7 @@ _DUMP_KWS = (
     "batch leaked",
     "join for notes",
     "pdf dump",
-)
+) + tuple(k.lower() for k in TELEGRAM_EXTRA_DUMP_KEYWORDS)
 
 # Soft education words — only meaningful together with dump signals / media.
 _CONTEXT_KWS = (
@@ -94,8 +96,8 @@ def score_channel(
 ) -> Dict[str, Any]:
     """Risk score 0-100 for a Telegram channel/group.
 
-    Favours non-viral dump patterns: low subscribers, high media ratio,
-    piracy keywords, multi-brand dumps.
+    Evidence only: media ratio, piracy wording, entity mentions, catalog and
+    fingerprint matches. Audience size is not a signal in either direction.
     """
     message_stats = message_stats or {}
     score = 0.0
@@ -110,21 +112,11 @@ def score_channel(
 
     title = (meta.get("title") or meta.get("username") or "").lower()
     about = (meta.get("about") or "").lower()
-    participants = int(meta.get("participants_count") or meta.get("members") or 0)
 
-    # Non-viral / small channels are the Phase C target
-    if 0 < participants < 500:
-        score += 25
-        signals.append("very_small_audience")
-    elif participants < 5000:
-        score += 18
-        signals.append("small_audience")
-    elif participants < 50000:
-        score += 8
-        signals.append("mid_audience")
-    else:
-        # Large channels can still pirate, but less "hidden"
-        score += 2
+    catalog_matches = int(message_stats.get("catalog_matches") or 0)
+    if catalog_matches:
+        score += min(20 + catalog_matches * 5, 40)
+        signals.append("official_title_or_duration_matches")
 
     title_blob = f"{title} {about}"
     kw_hits = [k for k in _DUMP_KWS if k in title_blob]

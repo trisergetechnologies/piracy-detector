@@ -187,17 +187,24 @@ def spectral_fingerprint(
 # ---------------------------------------------------------------------------
 
 
+_chromaprint_ok: Optional[bool] = None
+
+
 def chromaprint_available() -> bool:
-    try:
-        r = subprocess.run(
-            ["fpcalc", "-version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
+    """True if the `fpcalc` binary works (checked once per process)."""
+    global _chromaprint_ok
+    if _chromaprint_ok is None:
+        try:
+            r = subprocess.run(
+                ["fpcalc", "-version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            _chromaprint_ok = r.returncode == 0
+        except Exception:
+            _chromaprint_ok = False
+    return _chromaprint_ok
 
 
 def chromaprint_fingerprint(wav_path: str, length: int = 90) -> Optional[Fingerprint]:
@@ -235,53 +242,58 @@ def _hamming32(a: int, b: int) -> int:
     return (a ^ b).bit_count() if hasattr(int, "bit_count") else bin(a ^ b).count("1")
 
 
+def _fp_bits(a: Sequence[int], b: Sequence[int]) -> int:
+    """Chromaprint items are 32-bit; the spectral fallback uses 15 bits."""
+    return 32 if max(max(a), max(b)) >= (1 << 16) else 15
+
+
+_POPCOUNT8 = None
+
+
 def fingerprint_similarity(
     a: Sequence[int],
     b: Sequence[int],
-    max_offset: int = 40,
+    max_offset: Optional[int] = None,
+    min_overlap: int = 400,
 ) -> float:
-    """Sliding-window similarity in [0, 1]. Robust to small start-time shifts."""
-    if not a or not b:
+    """Best bit agreement in [0, 1] over every alignment of the two prints.
+
+    One item is ~0.1 s. The prints slide fully across each other as long as
+    at least *min_overlap* items (~40 s) overlap, so a 90 s official sample is
+    found anywhere inside a longer suspect sample (added intro), and two
+    equal-length samples tolerate a shifted start. The previous version did
+    not slide equal-length samples at all.
+    """
+    if not a or not b or min(len(a), len(b)) < 8:
         return 0.0
 
-    # Prefer comparing the shorter against the longer with offsets
-    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
-    if len(short) < 8:
-        return 0.0
+    import numpy as np
 
-    bits_per = 32  # chromaprint ints; spectral uses <=8 but same scorer works
+    global _POPCOUNT8
+    if _POPCOUNT8 is None:
+        _POPCOUNT8 = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint16)
+
+    bits = _fp_bits(a, b)
+    mask = (1 << bits) - 1
+    x = np.asarray([v & mask for v in a], dtype=np.uint32)
+    y = np.asarray([v & mask for v in b], dtype=np.uint32)
+    need = min(min_overlap, len(x), len(y))
     best = 0.0
-    span = min(max_offset, max(len(long_) - len(short), 0))
-
-    for offset in range(0, span + 1, 2):
-        window = long_[offset : offset + len(short)]
-        if len(window) < len(short):
-            break
-        matched_bits = 0
-        total_bits = 0
-        for x, y in zip(short, window):
-            # For spectral (small ints) hamming still fine
-            width = max(x.bit_length(), y.bit_length(), 8)
-            matched_bits += width - _hamming32(x & ((1 << width) - 1), y & ((1 << width) - 1))
-            total_bits += width
-        if total_bits:
-            best = max(best, matched_bits / total_bits)
-
-    # Also try reverse roles with coarser step if lengths differ a lot
-    if abs(len(a) - len(b)) > 20:
-        # subsample longer to short length for a quick extra pass
-        step = max(len(long_) // len(short), 1)
-        sampled = long_[::step][: len(short)]
-        if len(sampled) == len(short):
-            matched_bits = 0
-            total_bits = 0
-            for x, y in zip(short, sampled):
-                width = max(x.bit_length(), y.bit_length(), 8)
-                matched_bits += width - _hamming32(x & ((1 << width) - 1), y & ((1 << width) - 1))
-                total_bits += width
-            if total_bits:
-                best = max(best, matched_bits / total_bits)
-
+    lo, hi = -(len(y) - need), len(x) - need
+    if max_offset is not None:
+        lo, hi = max(lo, -max_offset), min(hi, max_offset)
+    for off in range(lo, hi + 1):
+        # off >= 0: x[off:] against y;  off < 0: x against y[-off:]
+        xs = x[off:] if off >= 0 else x
+        ys = y if off >= 0 else y[-off:]
+        n = min(len(xs), len(ys))
+        if n < need:
+            continue
+        diff = np.bitwise_xor(xs[:n], ys[:n])
+        wrong = int(_POPCOUNT8[diff.view(np.uint8)].sum())
+        sim = 1.0 - wrong / float(n * bits)
+        if sim > best:
+            best = sim
     return round(best, 4)
 
 
@@ -306,21 +318,22 @@ def extract_fingerprint_from_wav(
     wav_path: str,
     video_id: Optional[str] = None,
     prefer_chromaprint: bool = True,
+    max_seconds: int = 600,
 ) -> Optional[Dict[str, Any]]:
     """Extract fingerprint dict: {backend, values, duration_est, hash}."""
     backend = "spectral"
     values: Optional[Fingerprint] = None
 
     if prefer_chromaprint and chromaprint_available():
-        values = chromaprint_fingerprint(wav_path)
+        values = chromaprint_fingerprint(wav_path, length=max_seconds)
         if values:
             backend = "chromaprint"
 
     if values is None:
         try:
             samples, rate = read_wav_mono(wav_path)
-            # Downsample processing for speed if very long
-            max_samples = rate * 120
+            # Cap processing time on very long files
+            max_samples = rate * max_seconds
             if len(samples) > max_samples:
                 samples = samples[:max_samples]
             values = spectral_fingerprint(samples, rate)
@@ -347,8 +360,14 @@ def get_or_compute_fingerprint(
     video_id: str,
     wav_path: Optional[str],
 ) -> Optional[Dict[str, Any]]:
-    """Return cached fingerprint or compute from wav."""
-    for backend in ("chromaprint", "spectral"):
+    """Return cached fingerprint or compute from wav.
+
+    A cached spectral print is only reused while chromaprint is unavailable:
+    the two encodings cannot be compared, so mixing them would silently skip
+    comparisons once fpcalc gets installed.
+    """
+    backends = ("chromaprint",) if chromaprint_available() else ("chromaprint", "spectral")
+    for backend in backends:
         cached = load_cached_fingerprint(video_id, backend)
         if cached and cached.get("values"):
             return cached

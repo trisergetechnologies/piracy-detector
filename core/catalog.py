@@ -21,7 +21,8 @@ _TITLE_NOISE = re.compile(
     r"part\s*\d+|ep(isode)?\s*\d+|hd|4k|official)\b",
     re.IGNORECASE,
 )
-_NON_ALNUM = re.compile(r"[^a-z0-9\s]+")
+# Keep letters/digits of any script (Devanagari incl. vowel signs), drop punctuation.
+_NON_ALNUM = re.compile(r"(?:[^\w\s\u0900-\u097F]|_)+")
 _WS = re.compile(r"\s+")
 
 
@@ -61,8 +62,36 @@ def ingest_official_catalog(
       entries: list[dict]  – catalog rows (video_id, title, channel_id, ...)
       title_index: list[dict] – {video_id, title, norm_title, tokens}
     """
-    channel_ids = [c.strip() for c in (official_channel_ids or []) if c and c.strip()]
-    playlist_ids = [p.strip() for p in (official_playlist_ids or []) if p and p.strip()]
+    from core import funnel
+    from core.youtube_client import parse_duration, parse_playlist_ref
+
+    fn = funnel.current()
+    unresolved: List[str] = []
+
+    # Accept UC… ids, @handles and channel URLs (handles used to yield an empty catalog).
+    channel_ids: List[str] = []
+    for ref in [c.strip() for c in (official_channel_ids or []) if c and c.strip()]:
+        cid = None
+        try:
+            cid = yt_client.resolve_channel_id(ref)
+        except Exception as exc:
+            logger.error("Channel resolve failed for %s: %s", ref, exc)
+        if cid:
+            if cid not in channel_ids:
+                channel_ids.append(cid)
+        else:
+            unresolved.append(ref)
+            fn.unreachable(ref, "official channel could not be resolved to a YouTube channel id")
+            logger.warning("Official channel '%s' could not be resolved – ignored", ref)
+
+    playlist_ids: List[str] = []
+    for ref in [p.strip() for p in (official_playlist_ids or []) if p and p.strip()]:
+        pid = parse_playlist_ref(ref)
+        if pid:
+            playlist_ids.append(pid)
+        else:
+            unresolved.append(ref)
+            fn.unreachable(ref, "official playlist reference not understood")
 
     video_ids: Set[str] = set()
     owned_channels: Set[str] = set(channel_ids)
@@ -100,6 +129,19 @@ def ingest_official_catalog(
         except Exception as exc:
             logger.error("Catalog playlist ingest failed for %s: %s", pid, exc)
 
+    # Durations (1 quota unit per 50 videos) – used for title+duration matching.
+    duration_map: Dict[str, int] = {}
+    try:
+        for item in yt_client.get_video_details([e["video_id"] for e in entries]):
+            secs = parse_duration(item.get("contentDetails", {}).get("duration", ""))
+            if secs:
+                duration_map[item["id"]] = secs
+    except Exception as exc:
+        logger.warning("Catalog duration lookup failed: %s", exc)
+        fn.error("catalog_durations", str(exc))
+    for e in entries:
+        e["duration_seconds"] = duration_map.get(e["video_id"], 0)
+
     title_index = [
         {
             "video_id": e["video_id"],
@@ -107,20 +149,26 @@ def ingest_official_catalog(
             "norm_title": e.get("norm_title", ""),
             "tokens": title_tokens(e.get("title", "")),
             "channel_id": e.get("channel_id", ""),
+            "duration_seconds": e.get("duration_seconds", 0),
         }
         for e in entries
     ]
 
     logger.info(
-        "Official catalog ready: %d videos across %d channels",
+        "Official catalog ready: %d videos across %d channels (%d unresolved refs)",
         len(video_ids),
         len(owned_channels),
+        len(unresolved),
     )
+    fn.note("catalog", {"videos": len(video_ids), "channels": len(owned_channels),
+                        "with_duration": len(duration_map), "unresolved": unresolved})
     return {
         "video_ids": video_ids,
         "channel_ids": owned_channels,
         "entries": entries,
         "title_index": title_index,
+        "duration_map": duration_map,
+        "unresolved": unresolved,
     }
 
 
@@ -162,16 +210,27 @@ def catalog_derived_queries(
     entity_name: str,
     max_queries: int = 20,
 ) -> List[str]:
-    """Build search queries from official titles (subject-focused, brand-light)."""
+    """Build search queries from official titles (subject-focused, brand-light).
+
+    Titles are sampled evenly across the whole catalog (previously only the
+    first five titles were ever used), and the exact title is searched first
+    because lazy re-uploaders keep it.
+    """
+    from config import CATALOG_QUERY_TITLES
+
     queries: List[str] = []
     seen: Set[str] = set()
     name_lower = (entity_name or "").lower()
 
-    for entry in title_index:
+    usable = [
+        e for e in title_index
+        if len(e.get("norm_title") or normalize_title(e.get("title") or "")) >= 8
+    ]
+    step = max(len(usable) // max(CATALOG_QUERY_TITLES, 1), 1)
+
+    for entry in usable[::step]:
         title = entry.get("title") or ""
         norm = entry.get("norm_title") or normalize_title(title)
-        if not norm or len(norm) < 8:
-            continue
 
         # Prefer the distinctive middle of the title (drop entity name tokens).
         parts = [p for p in norm.split() if p not in name_lower.split()]
@@ -180,10 +239,9 @@ def catalog_derived_queries(
             core = norm[:60]
 
         variants = [
+            title.strip()[:90],
             f"{core} full lecture",
-            f"{core} telegram",
             f"{core} free",
-            f"{entity_name} {core}".strip() if entity_name else core,
         ]
         for q in variants:
             key = q.lower()

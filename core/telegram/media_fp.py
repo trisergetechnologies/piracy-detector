@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from config import (
     FINGERPRINT_MATCH_THRESHOLD,
     FINGERPRINT_SAMPLE_SECONDS,
+    FINGERPRINT_SPECTRAL_THRESHOLD,
     FINGERPRINT_STRONG_THRESHOLD,
     TELEGRAM_CACHE_DIR,
 )
@@ -68,14 +69,17 @@ def fingerprint_local_media(media_path: str) -> Optional[Dict[str, Any]]:
 def match_media_to_catalog(
     media_fp: Dict[str, Any],
     catalog_index: List[Dict[str, Any]],
-    threshold: float = FINGERPRINT_MATCH_THRESHOLD,
+    threshold: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Same comparison used for YouTube Phase B, for Telegram files."""
+    """Same comparison and tiers as the YouTube audio stage, for Telegram files."""
     values = media_fp.get("values") or []
     if not values or not catalog_index:
         return None
 
     backend = media_fp.get("backend")
+    spectral = backend != "chromaprint"
+    if threshold is None:
+        threshold = FINGERPRINT_SPECTRAL_THRESHOLD if spectral else FINGERPRINT_MATCH_THRESHOLD
     best = None
     best_sim = 0.0
     for item in catalog_index:
@@ -86,15 +90,16 @@ def match_media_to_catalog(
         sim = fingerprint_similarity(values, other)
         if sim > best_sim:
             best_sim = sim
+            is_match = sim >= threshold
+            is_strong = is_match and not spectral and sim >= FINGERPRINT_STRONG_THRESHOLD
             best = {
                 "official_video_id": item.get("video_id"),
                 "official_title": item.get("title", ""),
                 "similarity": sim,
-                "is_match": sim >= threshold,
-                "is_strong": sim >= FINGERPRINT_STRONG_THRESHOLD,
+                "is_match": is_match,
+                "is_strong": is_strong,
                 "backend": backend,
+                "tier": ("confirmed" if is_strong else "likely") if is_match else None,
                 "platform": "telegram",
             }
-    if best and best["is_match"]:
-        return best
     return best
