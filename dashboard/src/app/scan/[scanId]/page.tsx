@@ -48,16 +48,16 @@ export default function ScanResultsPage() {
       .finally(() => setLoading(false));
   }, [scanId]);
 
-  const defamatoryVideos = videos.filter(
-    (v) =>
-      v.classification === "DEFAMATORY" ||
-      v.score_result?.classification === "DEFAMATORY"
-  );
-  const piratedVideos = videos.filter(
-    (v) =>
-      v.classification === "PIRATED" ||
-      v.score_result?.classification === "PIRATED"
-  );
+  const defamatoryVideos = videos.filter((v) => {
+    const nested = (v as DetectedVideo & { score_result?: { classification?: string } })
+      .score_result?.classification;
+    return v.classification === "DEFAMATORY" || nested === "DEFAMATORY";
+  });
+  const piratedVideos = videos.filter((v) => {
+    const nested = (v as DetectedVideo & { score_result?: { classification?: string } })
+      .score_result?.classification;
+    return v.classification === "PIRATED" || nested === "PIRATED";
+  });
 
   const filteredVideos =
     tab === 0 ? videos : tab === 1 ? defamatoryVideos : piratedVideos;
