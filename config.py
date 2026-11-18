@@ -369,6 +369,9 @@ YOUTUBE_API_QUERY_TEMPLATES = [
 ]
 # Official titles (spread over the whole catalog) turned into search queries.
 CATALOG_QUERY_TITLES = _env_int("CATALOG_QUERY_TITLES", 25)
+# A title word found in more than this share of official titles is a common
+# course word (exam name, year) and does not identify a specific lecture.
+CATALOG_COMMON_TOKEN_RATIO = _env_float("CATALOG_COMMON_TOKEN_RATIO", 0.05)
 # Confirmed-hit titles re-used as queries on later scans (feedback).
 FEEDBACK_MAX_TITLE_QUERIES = _env_int("FEEDBACK_MAX_TITLE_QUERIES", 10)
 # Channels of confirmed hits that are re-crawled on later scans (feedback).

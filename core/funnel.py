@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from collections import Counter
 from contextvars import ContextVar
@@ -22,6 +23,14 @@ logger = logging.getLogger(__name__)
 
 _MAX_DROPS = 20000
 _MAX_QUERIES = 2000
+
+# Error text from HTTP clients can embed the request URL, including API keys.
+# Funnel data is returned in scan summaries, so secrets are stripped on entry.
+_SECRET_RE = re.compile(r"(?i)\b(key|api_key|apikey|access_token|token)=[A-Za-z0-9_\-\.]+")
+
+
+def redact(text: Any) -> str:
+    return _SECRET_RE.sub(r"\1=REDACTED", str(text))
 
 
 class Funnel:
@@ -51,7 +60,7 @@ class Funnel:
             if len(self.queries) < _MAX_QUERIES:
                 row = {"source": source, "query": query, "raw": raw, "new": new}
                 if error:
-                    row["error"] = error[:200]
+                    row["error"] = redact(error)[:200]
                 self.queries.append(row)
 
     def drop(self, item_id: Any, stage: str, reason: str, final: bool = True, **detail: Any) -> None:
@@ -73,10 +82,10 @@ class Funnel:
     def error(self, kind: str, message: str = "") -> None:
         with self._lock:
             self.errors[kind] += 1
-            self.error_samples.setdefault(kind, str(message)[:300])
+            self.error_samples.setdefault(kind, redact(message)[:300])
 
     def unreachable(self, what: str, reason: str) -> None:
-        self.inaccessible.append({"item": str(what), "reason": str(reason)[:200]})
+        self.inaccessible.append({"item": str(what), "reason": redact(reason)[:200]})
 
     def weak_match(self, item: dict) -> None:
         if len(self.weak) < 500:

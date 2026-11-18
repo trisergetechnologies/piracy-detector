@@ -12,7 +12,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Set
 
-from config import CATALOG_MAX_PER_SOURCE
+from config import CATALOG_COMMON_TOKEN_RATIO, CATALOG_MAX_PER_SOURCE
 
 logger = logging.getLogger(__name__)
 
@@ -198,11 +198,36 @@ def best_catalog_match(
 
     if best is None or best_score < threshold:
         return None
+    # Words the rights holder puts in most titles ("UP TGT PGT 2026") are also
+    # in every competitor's titles; only words rare inside the catalog say
+    # which lecture this is.
+    df = _token_df(title_index)
+    rare_cut = max(2, int(len(title_index) * CATALOG_COMMON_TOKEN_RATIO))
+    distinctive = [t for t in cand_tokens & best["tokens"] if df.get(t, 0) <= rare_cut]
     return {
         "official_video_id": best["video_id"],
         "official_title": best["title"],
         "similarity": round(best_score, 3),
+        "distinctive_shared": len(distinctive),
     }
+
+
+_DF_CACHE: Dict[int, Any] = {}
+
+
+def _token_df(title_index: List[dict]) -> Dict[str, int]:
+    """Number of official titles each token appears in (cached per catalog)."""
+    key = id(title_index)
+    hit = _DF_CACHE.get(key)
+    if hit and hit[0] == len(title_index):
+        return hit[1]
+    df: Dict[str, int] = {}
+    for entry in title_index:
+        for tok in entry.get("tokens") or ():
+            df[tok] = df.get(tok, 0) + 1
+    _DF_CACHE.clear()
+    _DF_CACHE[key] = (len(title_index), df)
+    return df
 
 
 def catalog_derived_queries(

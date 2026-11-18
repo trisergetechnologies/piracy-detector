@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
+from urllib.parse import quote_plus
 
 import requests
 
@@ -187,11 +188,22 @@ def search_ytdlp(
             dr_kwargs["end"] = date_to.replace("-", "")[:8]
         ydl_opts["daterange"] = yt_dlp.utils.DateRange(**dr_kwargs)
 
+    if by_date:
+        ydl_opts["playlistend"] = max_results
+
     results: List[dict] = []
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            prefix = "ytsearchdate" if by_date else "ytsearch"
-            data = ydl.extract_info(f"{prefix}{max_results}:{query}", download=False)
+            if by_date:
+                # yt-dlp has no "ytsearchdate" key any more; the results URL
+                # with sp=CAI= is YouTube's own "sort by upload date".
+                target = (
+                    "https://www.youtube.com/results?search_query="
+                    f"{quote_plus(query)}&sp=CAI%3D"
+                )
+            else:
+                target = f"ytsearch{max_results}:{query}"
+            data = ydl.extract_info(target, download=False)
             if not data:
                 return results
 
@@ -201,6 +213,8 @@ def search_ytdlp(
                 vid = entry.get("id") or entry.get("url", "").split("=")[-1]
                 if not vid or len(vid) < 5:
                     continue
+                if by_date and len(vid) != 11:
+                    continue  # the results page also lists channels/playlists
                 results.append(
                     _video_dict(
                         video_id=vid,
@@ -284,11 +298,12 @@ def search_youtube_api(
                 )
             )
     except Exception as exc:
-        logger.error("YouTube API search failed for '%s': %s", query, exc)
-        kind = "youtube_api_quota" if ("quota" in str(exc).lower() or "429" in str(exc)) else "youtube_api_search"
-        funnel.current().error(kind, f"{query}: {exc}")
+        msg = funnel.redact(exc)  # the error text embeds the request URL + API key
+        logger.error("YouTube API search failed for '%s': %s", query, msg)
+        kind = "youtube_api_quota" if ("quota" in msg.lower() or "429" in msg) else "youtube_api_search"
+        funnel.current().error(kind, f"{query}: {msg}")
         if errors is not None:
-            errors.append(f"{kind}: {exc}")
+            errors.append(f"{kind}: {msg}")
 
     return results
 

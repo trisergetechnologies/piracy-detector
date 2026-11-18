@@ -91,6 +91,63 @@ def test_title_and_duration_match_are_signals():
     assert "duration_match_official" in h["signals"]
 
 
+def _exam_catalog():
+    """Catalog where every title carries the same exam words (as real edtech catalogs do)."""
+    from core.catalog import title_tokens
+
+    topics = [
+        "Ellipse Conic Section", "Vector Algebra Practice", "Atomic Structure Numericals",
+        "Angiosperms Botany MCQ", "Rotational Mechanics Physics", "Food Adulteration Nutrition",
+        "Chhayavaad Hindi Sahitya", "Population Geography Migration", "Child Development Pedagogy",
+        "Indian Polity Constitution", "Mughal History Medieval", "Organic Hydrocarbon Chemistry",
+    ]
+    index, durations = [], {}
+    for i, topic in enumerate(topics):
+        vid = f"off{i:08d}"
+        title = f"UP TGT PGT 2026 Current Affairs Special {topic}"
+        index.append({"video_id": vid, "title": title, "tokens": title_tokens(title)})
+        durations[vid] = 3600 + i * 137
+    return {"video_ids": {e["video_id"] for e in index}, "channel_ids": {"UC" + "o" * 22},
+            "title_index": index, "duration_map": durations}
+
+
+def test_same_syllabus_title_from_another_institute_is_not_flagged():
+    # Real false positive: other coaching channels share only the exam words.
+    from core.scorer import piracy_evidence
+
+    v = _video(title="UP TGT PGT 2026 Current Affairs Special Marathon by Other Institute",
+               duration_seconds=5000)
+    v["heuristic"] = piracy_heuristic_score(v, _exam_catalog())
+    assert not any(s.startswith("catalog_title_match") for s in v["heuristic"]["signals"])
+    ev = piracy_evidence(v, {"llm_error": True})
+    assert ev["confidence"] < 60
+
+
+def test_same_lecture_title_still_flagged_and_duration_makes_it_likely():
+    from core.scorer import piracy_evidence
+
+    cat = _exam_catalog()
+    title = "UP TGT PGT 2026 Current Affairs Special Ellipse Conic Section"
+    weak = _video(title=title, duration_seconds=999)
+    weak["heuristic"] = piracy_heuristic_score(weak, cat)
+    ev = piracy_evidence(weak, {"llm_error": True})
+    assert ev["tier"] == "weak" and ev["confidence"] >= 60
+
+    # One distinctive word only, but the same length as that exact lecture.
+    copy = _video(title="UP TGT PGT 2026 Current Affairs Ellipse", duration_seconds=3601)
+    copy["heuristic"] = piracy_heuristic_score(copy, cat)
+    assert piracy_evidence(copy, {"llm_error": True})["tier"] == "likely"
+
+
+def test_funnel_redacts_api_keys():
+    from core import funnel
+
+    f = funnel.Funnel("t", "youtube")
+    f.error("youtube_api_quota", "HttpError 429 https://x/search?q=a&key=AIzaSyABC-123_def&alt=json")
+    sample = f.compact()["errors"]["youtube_api_quota"]["sample"]
+    assert "AIzaSy" not in sample and "key=REDACTED" in sample
+
+
 def test_retitled_copy_gets_duration_signal():
     h = piracy_heuristic_score(_video(title="Lec 4 full"), _catalog())
     assert f"duration_equals_official:{OFFICIAL_ID}" in h["signals"]

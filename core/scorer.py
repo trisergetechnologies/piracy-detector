@@ -283,7 +283,7 @@ def piracy_evidence(enriched_video: dict, text_result: Optional[dict] = None) ->
         return {"tier": "likely", "confidence": 85 if title_sim >= 0.7 else 80,
                 "reason": f"same title ({title_sim:.0%} similar) and same duration as official "
                           f"video '{official_title}', uploaded by a non-official channel{llm_note}"}
-    if cm and llm_pirated:
+    if cm and llm_pirated and int(cm.get("distinctive_shared", 2)) >= 2:
         return {"tier": "likely", "confidence": 75,
                 "reason": f"title matches official video '{official_title}' ({title_sim:.0%}) and "
                           f"AI classifier flagged it: {text_result.get('reason', '')}"}
@@ -293,9 +293,17 @@ def piracy_evidence(enriched_video: dict, text_result: Optional[dict] = None) ->
         return {"tier": "weak", "confidence": min(max(llm_conf - 20, 60), 69),
                 "reason": f"metadata only, no content match – AI classifier: {text_result.get('reason', '')}"}
     if cm:
-        return {"tier": "weak", "confidence": min(69, 58 + int(title_sim * 10)),
-                "reason": f"title resembles official video '{official_title}' ({title_sim:.0%}); "
-                          f"content not verified{llm_note}"}
+        # Measured on a real scan: 66 of 66 title-only hits were other
+        # institutes teaching the same syllabus; they shared only words that
+        # are common across the official catalog. Those stay below the default
+        # threshold (recorded in the funnel log, not raised as alerts).
+        if int(cm.get("distinctive_shared", 2)) >= 2 and title_sim >= 0.6:
+            return {"tier": "weak", "confidence": min(69, 58 + int(title_sim * 10)),
+                    "reason": f"title resembles official video '{official_title}' ({title_sim:.0%}); "
+                              f"content not verified{llm_note}"}
+        return {"tier": "weak", "confidence": min(55, 30 + int(title_sim * 25)),
+                "reason": f"title shares only common course words with official video "
+                          f"'{official_title}' ({title_sim:.0%}); content not verified{llm_note}"}
     dur_ref = _signal_value(signals, "duration_equals_official")
     if dur_ref and ("brand_mention" in signals or "piracy_title_kw" in signals):
         return {"tier": "weak", "confidence": 62,

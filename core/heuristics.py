@@ -108,10 +108,17 @@ def piracy_heuristic_score(
     )
     if catalog_match:
         sim = catalog_match["similarity"]
-        score += 20 + min(sim, 1.0) * 15
-        signals.append(f"catalog_title_match:{sim}")
         official_dur = safe_int(duration_map.get(catalog_match["official_video_id"]))
-        if durations_match(duration, official_dur):
+        same_duration = durations_match(duration, official_dur)
+        if catalog_match.get("distinctive_shared", 0) >= 2 or same_duration:
+            score += 20 + min(sim, 1.0) * 15
+            signals.append(f"catalog_title_match:{sim}")
+        else:
+            # Shares only the catalog's common course words: same subject,
+            # not evidence of a copy. Keeps a small ranking nudge only.
+            score += 5
+            signals.append(f"generic_title_overlap:{sim}")
+        if same_duration:
             score += 25
             signals.append("duration_match_official")
     elif duration >= 300 and duration_map:
@@ -137,7 +144,8 @@ def _mark_bulk_channels(videos: List[dict]) -> None:
     """A channel hosting several official-titled videos is a dump channel."""
     per_channel: Dict[str, int] = {}
     for v in videos:
-        if (v.get("heuristic") or {}).get("catalog_match") and v.get("channel_id"):
+        sigs = (v.get("heuristic") or {}).get("signals") or []
+        if v.get("channel_id") and any(s.startswith("catalog_title_match") for s in sigs):
             per_channel[v["channel_id"]] = per_channel.get(v["channel_id"], 0) + 1
     for v in videos:
         n = per_channel.get(v.get("channel_id") or "", 0)

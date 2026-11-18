@@ -182,6 +182,10 @@ def media_catalog_match(media: Optional[dict], text: str, catalog: Optional[dict
         out["duration_match"] = durations_match(
             duration, int(duration_map.get(best["official_video_id"]) or 0)
         )
+        if best.get("distinctive_shared", 2) < 2 and not out["duration_match"]:
+            # Shares only the catalog's common course words (exam name, year):
+            # same subject, not evidence of this lecture.
+            return {"title_sim": 0.0, "duration_match": False}
     elif duration >= 120:
         for off_vid, off_dur in duration_map.items():
             if abs(duration - int(off_dur or 0)) <= 1:
